@@ -141,7 +141,14 @@ export class EquipmentSystem {
     zombieManager: ZombieManager,
     onExplosion: (distOrigin: THREE.Vector3) => void,
     onTurretShot: (from: THREE.Vector3, to: THREE.Vector3) => void,
-    onZombieKill: (z: ZombieInstance) => void
+    onZombieKill: (z: ZombieInstance) => void,
+    onEquipmentHit?: (
+      z: ZombieInstance,
+      damage: number,
+      dir: THREE.Vector3,
+      source: 'grenade' | 'turret',
+      killed: boolean
+    ) => void
   ): void {
     // 1. Grenades
     for (let i = this.grenades.length - 1; i >= 0; i--) {
@@ -162,7 +169,7 @@ export class EquipmentSystem {
       g.mesh.position.copy(g.position);
 
       if (g.fuse <= 0) {
-        this.detonateGrenade(g.position, zombieManager, onZombieKill);
+        this.detonateGrenade(g.position, zombieManager, onZombieKill, onEquipmentHit);
         onExplosion(g.position);
         this.scene.remove(g.mesh);
         this.grenades.splice(i, 1);
@@ -242,7 +249,14 @@ export class EquipmentSystem {
 
           const hitPoint = nearest.position.clone().add(new THREE.Vector3(0, 1.2 * nearest.scale, 0));
           onTurretShot(t.position, hitPoint);
-          zombieManager.damageZombie(nearest, 26, onZombieKill);
+          const shotDir = hitPoint.clone().sub(t.position).normalize();
+          if (zombieManager.localSpawnPaused) {
+            zombieManager.applyLocalVisualHit(nearest);
+            onEquipmentHit?.(nearest, 26, shotDir, 'turret', false);
+          } else {
+            const killed = zombieManager.damageZombie(nearest, 26, onZombieKill, shotDir, 1.2);
+            onEquipmentHit?.(nearest, 26, shotDir, 'turret', killed);
+          }
         }
       } else {
         // Idle sentry sweep
@@ -254,7 +268,14 @@ export class EquipmentSystem {
   private detonateGrenade(
     center: THREE.Vector3,
     zombieManager: ZombieManager,
-    onZombieKill: (z: ZombieInstance) => void
+    onZombieKill: (z: ZombieInstance) => void,
+    onEquipmentHit?: (
+      z: ZombieInstance,
+      damage: number,
+      dir: THREE.Vector3,
+      source: 'grenade' | 'turret',
+      killed: boolean
+    ) => void
   ): void {
     const sphereGeo = new THREE.SphereGeometry(1, 14, 14);
     const mat = new THREE.MeshBasicMaterial({
@@ -280,7 +301,16 @@ export class EquipmentSystem {
       if (dist <= blastRadius) {
         const falloff = 1 - (dist / blastRadius) * 0.65;
         const dmg = Math.round(280 * falloff);
-        zombieManager.damageZombie(z, dmg, onZombieKill);
+        const dir = z.position.clone().sub(center);
+        if (dir.lengthSq() < 1e-4) dir.set(0, 0.4, 1);
+        else dir.normalize();
+        if (zombieManager.localSpawnPaused) {
+          zombieManager.applyLocalVisualHit(z);
+          onEquipmentHit?.(z, dmg, dir, 'grenade', false);
+        } else {
+          const killed = zombieManager.damageZombie(z, dmg, onZombieKill, dir, 7.5 * falloff);
+          onEquipmentHit?.(z, dmg, dir, 'grenade', killed);
+        }
       }
     }
   }

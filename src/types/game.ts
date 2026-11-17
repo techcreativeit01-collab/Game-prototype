@@ -508,9 +508,17 @@ export type ClientToServerMsg =
       avatarId: number;
       level: number;
       skin: CharacterSkinId;
+      maxHealth?: number;
       reconnectRoomId?: string;
     }
-  | { type: 'profile:update'; username: string; avatarId: number; level: number; skin: CharacterSkinId }
+  | {
+      type: 'profile:update';
+      username: string;
+      avatarId: number;
+      level: number;
+      skin: CharacterSkinId;
+      maxHealth?: number;
+    }
   | { type: 'lobby:chat'; text: string }
   | { type: 'room:chat'; text: string }
   | { type: 'lobby:invite'; targetPlayerId: string }
@@ -539,8 +547,10 @@ export type ClientToServerMsg =
       damage: number;
       headshot: boolean;
       weaponId: WeaponId;
+      source?: 'weapon' | 'grenade' | 'turret';
     }
   | { type: 'match:use_medkit' }
+  | { type: 'match:use_armor' }
   | { type: 'rtc:signal'; targetPlayerId: string; payload: unknown };
 
 export type ServerToClientMsg =
@@ -552,7 +562,15 @@ export type ServerToClientMsg =
   | { type: 'match:started'; roomId: string; mode: 'coop' | 'competitive' }
   | { type: 'match:snapshot'; snapshot: MultiplayerMatchSnapshot }
   | { type: 'match:zombie_killed'; zombieId: number; killerId: string; coinReward: number; xpReward: number }
-  | { type: 'match:player_damaged'; targetPlayerId: string; health: number; damage: number; attackerX: number; attackerZ: number }
+  | {
+      type: 'match:player_damaged';
+      targetPlayerId: string;
+      health: number;
+      armor: number;
+      damage: number;
+      attackerX: number;
+      attackerZ: number;
+    }
   | { type: 'match:ended'; winnerId: string | null; reason: string; bonusCoins: number; bonusXp: number }
   | { type: 'rtc:signal'; fromPlayerId: string; payload: unknown }
   | { type: 'error'; message: string };

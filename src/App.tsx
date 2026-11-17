@@ -58,10 +58,11 @@ export default function App() {
     [progression]
   );
   const audioMgr = useMemo(() => new AudioManager(settingsMgr.get()), [settingsMgr]);
-  const mpClient = useMemo(
-    () => new MultiplayerClient(progression.getData().profile),
-    [progression]
-  );
+  const mpClient = useMemo(() => {
+    const data = progression.getData();
+    const maxHp = 100 + (data.upgrades[UpgradeId.MAX_HEALTH] ?? 0) * 20;
+    return new MultiplayerClient(data.profile, maxHp);
+  }, [progression]);
 
   const [saveData, setSaveData] = useState<SaveData>(() => progression.getData());
   const [settings, setSettings] = useState<SettingsData>(() => settingsMgr.get());
@@ -77,6 +78,7 @@ export default function App() {
 
   // Multiplayer UI state
   const [mpStatus, setMpStatus] = useState<MpConnectionStatus>('disconnected');
+  const [mpError, setMpError] = useState<string | null>(null);
   const [lobbyPlayers, setLobbyPlayers] = useState<LobbyPlayer[]>([]);
   const [rooms, setRooms] = useState<MultiplayerRoomState[]>([]);
   const [currentRoom, setCurrentRoom] = useState<MultiplayerRoomState | null>(null);
@@ -84,6 +86,7 @@ export default function App() {
   const [pendingInvite, setPendingInvite] = useState<InviteNotice | null>(null);
   const [micActive, setMicActive] = useState(false);
   const [voiceDeafened, setVoiceDeafened] = useState(false);
+  const lastMpProfileKeyRef = useRef('');
 
   const pushToast = useCallback((text: string, isError = false) => {
     const id = Date.now() + Math.random();
@@ -109,7 +112,12 @@ export default function App() {
   useEffect(() => {
     const unsubSave = progression.subscribe((next) => {
       setSaveData({ ...next });
-      mpClient.updateProfile(next.profile);
+      const maxHp = 100 + (next.upgrades[UpgradeId.MAX_HEALTH] ?? 0) * 20;
+      const key = `${next.profile.username}|${next.profile.avatarId}|${next.profile.level}|${next.profile.selectedCharacterSkin}|${maxHp}`;
+      if (key !== lastMpProfileKeyRef.current) {
+        lastMpProfileKeyRef.current = key;
+        mpClient.updateProfile(next.profile, maxHp);
+      }
     });
     const unsubSettings = settingsMgr.subscribe((next) => {
       setSettings(next);
@@ -126,12 +134,18 @@ export default function App() {
   // Multiplayer WebSocket subscription
   useEffect(() => {
     const unsub = mpClient.subscribe({
-      onStatusChange: (status) => setMpStatus(status),
+      onStatusChange: (status) => {
+        setMpStatus(status);
+        if (status === 'connected') setMpError(null);
+      },
       onLobbyUpdate: (players, nextRooms) => {
         setLobbyPlayers(players);
         setRooms(nextRooms);
       },
-      onRoomUpdate: (room) => setCurrentRoom(room),
+      onRoomUpdate: (room) => {
+        setCurrentRoom(room);
+        setMpError(null);
+      },
       onChatMessage: (msg) => {
         setChatMessages((prev) => [...prev.slice(-49), msg]);
         audioMgr.playChatPing();
@@ -144,8 +158,9 @@ export default function App() {
         audioMgr.unlock();
         setActiveModal(null);
         setGameOverStats(null);
+        setMpError(null);
         setScreen('playing');
-        engineRef.current?.startMultiplayerGame(mode, progression.getData().profile.playerId);
+        engineRef.current?.startMultiplayerGame(mode, mpClient.getNetworkPlayerId());
         pushToast(`Squad deployed (${mode.toUpperCase()})`);
       },
       onMatchSnapshot: (snapshot) => {
@@ -154,16 +169,26 @@ export default function App() {
       onZombieKilled: (zombieId, killerId, coinReward, xpReward) => {
         engineRef.current?.handleServerZombieKilled(zombieId, killerId, coinReward, xpReward);
       },
-      onPlayerDamaged: (damage, attackerX, attackerZ, serverHealth) => {
-        engineRef.current?.handleServerPlayerDamaged(damage, attackerX, attackerZ, serverHealth);
+      onPlayerDamaged: (damage, attackerX, attackerZ, serverHealth, serverArmor) => {
+        engineRef.current?.handleServerPlayerDamaged(
+          damage,
+          attackerX,
+          attackerZ,
+          serverHealth,
+          serverArmor
+        );
       },
       onMatchEnded: (winnerId, reason, bonusCoins, bonusXp) => {
         engineRef.current?.endMultiplayerMatch(winnerId, reason, bonusCoins, bonusXp);
       },
-      onError: (msg) => pushToast(msg, true),
+      onError: (msg) => {
+        setMpError(msg);
+        pushToast(msg, true);
+      },
     });
 
-    mpClient.connect();
+    const initialMaxHp = 100 + (progression.getData().upgrades[UpgradeId.MAX_HEALTH] ?? 0) * 20;
+    mpClient.connect(initialMaxHp);
     return () => {
       unsub();
       mpClient.disconnect();
@@ -200,8 +225,9 @@ export default function App() {
         onToast: pushToast,
         onContextLost: (lost) => setContextLost(lost),
         onMultiplayerStateSend: (payload) => mpClient.sendPlayerState(payload),
-        onMultiplayerShotHit: (zombieId, damage, headshot, weaponId) =>
-          mpClient.sendShotHit(zombieId, damage, headshot, weaponId),
+        onMultiplayerShotHit: (zombieId, damage, headshot, weaponId, source) =>
+          mpClient.sendShotHit(zombieId, damage, headshot, weaponId, source),
+        onMultiplayerUseConsumable: (kind) => mpClient.sendUseConsumable(kind),
       }
     );
 
@@ -476,16 +502,30 @@ export default function App() {
       {activeModal === 'multiplayer' && (
         <MultiplayerModal
           saveData={saveData}
+          localPlayerId={mpClient.getNetworkPlayerId()}
           status={mpStatus}
+          mpError={mpError}
           lobbyPlayers={lobbyPlayers}
           rooms={rooms}
           currentRoom={currentRoom}
           chatMessages={chatMessages}
           onConnect={() => mpClient.connect()}
-          onQuickMatch={(mode) => mpClient.quickMatch(mode)}
-          onCreateRoom={(name, mode) => mpClient.createRoom(name, mode)}
-          onJoinRoom={(code) => mpClient.joinRoom(code)}
-          onLeaveRoom={() => mpClient.leaveRoom()}
+          onQuickMatch={(mode) => {
+            setMpError(null);
+            mpClient.quickMatch(mode);
+          }}
+          onCreateRoom={(name, mode) => {
+            setMpError(null);
+            mpClient.createRoom(name, mode);
+          }}
+          onJoinRoom={(code) => {
+            setMpError(null);
+            mpClient.joinRoom(code);
+          }}
+          onLeaveRoom={() => {
+            setMpError(null);
+            mpClient.leaveRoom();
+          }}
           onToggleReady={(ready) => mpClient.setReady(ready)}
           onStartMatch={() => mpClient.startMatch()}
           onInvitePlayer={(pid) => {

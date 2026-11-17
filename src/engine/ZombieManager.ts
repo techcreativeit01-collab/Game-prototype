@@ -634,18 +634,19 @@ export class ZombieManager {
       seenIds.add(snap.id);
       let z = this.getZombieById(snap.id);
       if (!z && snap.state !== 'dead') {
+        const gy = groundHeightAt(snap.x, snap.z);
         z = this.createZombieRecord(
           snap.id,
           snap.type,
           snap.x,
-          snap.y,
+          gy,
           snap.z,
           lodDistanceScale
         );
       }
       if (!z) continue;
 
-      z.targetPos.set(snap.x, snap.y, snap.z);
+      z.targetPos.set(snap.x, groundHeightAt(snap.x, snap.z), snap.z);
       z.targetYaw = snap.yaw;
       z.health = snap.health;
       z.maxHealth = snap.maxHealth;
@@ -711,6 +712,7 @@ export class ZombieManager {
       }
 
       z.position.lerp(z.targetPos, Math.min(1, dt * 14));
+      z.position.y = groundHeightAt(z.position.x, z.position.z);
       z.root.position.copy(z.position);
 
       let diff = z.targetYaw - z.yaw;

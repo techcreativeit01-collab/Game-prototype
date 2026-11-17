@@ -51,6 +51,7 @@ interface ClientSession {
   avatarId: number;
   level: number;
   skin: CharacterSkinId;
+  maxHealth: number;
   roomId: string | null;
 }
 
@@ -75,6 +76,7 @@ interface ServerZombieEntity {
 }
 
 interface MatchPlayerRuntime extends RemotePlayerSnapshot {
+  armor: number;
   lastShotAt: number;
   disconnectedAt: number | null;
 }
@@ -200,6 +202,7 @@ function startRoomMatch(room: RoomRuntime): void {
   room.state.members.forEach((m, idx) => {
     const angle = (idx / Math.max(1, room.state.members.length)) * Math.PI * 2;
     const spawnDist = room.state.mode === 'competitive' ? 14 : 3.5;
+    const clientMaxHp = clients.get(m.playerId)?.maxHealth ?? 120;
     room.players.set(m.playerId, {
       playerId: m.playerId,
       username: m.username,
@@ -211,8 +214,9 @@ function startRoomMatch(room: RoomRuntime): void {
       z: Math.sin(angle) * spawnDist,
       yaw: 0,
       pitch: 0,
-      health: 120,
-      maxHealth: 120,
+      health: clientMaxHp,
+      maxHealth: clientMaxHp,
+      armor: 25,
       alive: true,
       isMoving: false,
       isSprinting: false,
@@ -353,7 +357,14 @@ function stepRoomMatch(room: RoomRuntime, dt: number): void {
       z.state = 'attack';
       if (z.attackTimer <= 0) {
         z.attackTimer = z.attackCooldown;
-        target.health = Math.max(0, target.health - z.damage);
+        let incoming = z.damage;
+        if (target.armor > 0) {
+          const absorbed = Math.min(target.armor, incoming * 0.65);
+          target.armor -= absorbed;
+          incoming -= absorbed;
+        }
+        const applied = Math.max(1, Math.round(incoming));
+        target.health = Math.max(0, target.health - applied);
         if (target.health <= 0) target.alive = false;
         const targetClient = clients.get(target.playerId);
         if (targetClient) {
@@ -361,6 +372,7 @@ function stepRoomMatch(room: RoomRuntime, dt: number): void {
             type: 'match:player_damaged',
             targetPlayerId: target.playerId,
             health: target.health,
+            armor: Math.round(target.armor),
             damage: z.damage,
             attackerX: z.x,
             attackerZ: z.z,
@@ -448,6 +460,14 @@ function leaveCurrentRoom(session: ClientSession): void {
     stopRoomTimers(room);
     rooms.delete(room.state.roomId);
   } else {
+    if (room.state.status === 'countdown') {
+      if (room.countdownTimer) {
+        clearInterval(room.countdownTimer);
+        room.countdownTimer = null;
+      }
+      room.state.status = 'waiting';
+      room.state.countdownSec = 0;
+    }
     if (room.state.hostId === session.playerId) {
       room.state.hostId = room.state.members[0].playerId;
       room.state.members[0].isHost = true;
@@ -576,7 +596,18 @@ async function bootstrapServer() {
   }
 
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (req, socket, head) => {
+    const pathname = (req.url || '').split('?')[0];
+    if (pathname === '/ws') {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
+      });
+    } else {
+      socket.destroy();
+    }
+  });
 
   wss.on('connection', (ws) => {
     let session: ClientSession | null = null;
@@ -590,7 +621,12 @@ async function bootstrapServer() {
       }
 
       if (msg.type === 'auth:hello') {
-        const pid = (msg.playerId || `OP-${Math.random().toString(36).slice(2, 8)}`).slice(0, 20);
+        const pid = (msg.playerId || `OP-${Math.random().toString(36).slice(2, 8)}`).slice(0, 24);
+        const existing = clients.get(pid);
+        if (existing && existing.ws !== ws && existing.ws.readyState === WebSocket.OPEN) {
+          existing.ws.close(4000, 'Replaced by newer connection');
+        }
+        const safeMaxHp = Math.max(100, Math.min(320, Math.round(Number(msg.maxHealth) || 120)));
         session = {
           ws,
           playerId: pid,
@@ -598,6 +634,7 @@ async function bootstrapServer() {
           avatarId: Number(msg.avatarId) || 0,
           level: Math.max(1, Number(msg.level) || 1),
           skin: msg.skin || 'ranger',
+          maxHealth: safeMaxHp,
           roomId: null,
         };
         clients.set(pid, session);
@@ -630,6 +667,9 @@ async function bootstrapServer() {
           session.avatarId = Number(msg.avatarId) || 0;
           session.level = Math.max(1, Number(msg.level) || 1);
           session.skin = msg.skin || session.skin;
+          if (typeof msg.maxHealth === 'number') {
+            session.maxHealth = Math.max(100, Math.min(320, Math.round(msg.maxHealth)));
+          }
           if (session.roomId) {
             const room = rooms.get(session.roomId);
             const mem = room?.state.members.find((m) => m.playerId === session!.playerId);
@@ -786,7 +826,12 @@ async function bootstrapServer() {
           const shooter = room.players.get(session.playerId);
           if (!shooter || !shooter.alive) break;
 
-          const maxPlausible = WEAPON_MAX_SINGLE_SHOT_DMG[msg.weaponId] ?? 200;
+          const maxPlausible =
+            msg.source === 'grenade'
+              ? 300
+              : msg.source === 'turret'
+              ? 40
+              : WEAPON_MAX_SINGLE_SHOT_DMG[msg.weaponId] ?? 200;
           const validatedDmg = Math.max(1, Math.min(maxPlausible, Math.round(msg.damage)));
           const z = room.zombies.find((item) => item.id === msg.zombieId);
           if (!z || z.state === 'dead') break;
@@ -819,6 +864,15 @@ async function bootstrapServer() {
           break;
         }
 
+        case 'match:use_armor': {
+          const room = session.roomId ? rooms.get(session.roomId) : null;
+          const mp = room?.players.get(session.playerId);
+          if (mp && mp.alive) {
+            mp.armor = Math.min(100, mp.armor + 50);
+          }
+          break;
+        }
+
         case 'rtc:signal': {
           const target = clients.get(msg.targetPlayerId);
           if (target) {
@@ -836,6 +890,9 @@ async function bootstrapServer() {
     ws.on('close', () => {
       if (!session) return;
       const pid = session.playerId;
+      if (clients.get(pid) !== session) {
+        return;
+      }
       clients.delete(pid);
       if (session.roomId) {
         const room = rooms.get(session.roomId);

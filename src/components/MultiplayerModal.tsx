@@ -25,7 +25,9 @@ import { AvatarBadge } from './AvatarBadge';
 
 interface Props {
   saveData: SaveData;
+  localPlayerId: string;
   status: MpConnectionStatus;
+  mpError?: string | null;
   lobbyPlayers: LobbyPlayer[];
   rooms: MultiplayerRoomState[];
   currentRoom: MultiplayerRoomState | null;
@@ -44,7 +46,9 @@ interface Props {
 
 export const MultiplayerModal: React.FC<Props> = ({
   saveData,
+  localPlayerId,
   status,
+  mpError,
   lobbyPlayers,
   rooms,
   currentRoom,
@@ -66,10 +70,8 @@ export const MultiplayerModal: React.FC<Props> = ({
   const [chatText, setChatText] = useState('');
   const [copiedCode, setCopiedCode] = useState(false);
 
-  const localMember = currentRoom?.members.find(
-    (m) => m.playerId === saveData.profile.playerId
-  );
-  const isHost = currentRoom?.hostId === saveData.profile.playerId;
+  const localMember = currentRoom?.members.find((m) => m.playerId === localPlayerId);
+  const isHost = currentRoom?.hostId === localPlayerId;
   const activeChannel: 'lobby' | 'room' = currentRoom ? 'room' : 'lobby';
   const filteredMessages = chatMessages.filter(
     (m) => m.channel === activeChannel || (!currentRoom && m.channel === 'lobby')
@@ -132,6 +134,21 @@ export const MultiplayerModal: React.FC<Props> = ({
         <div className="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-12">
           {/* Left 7 cols: Room Management / Squad Staging */}
           <div className="lg:col-span-7 p-5 overflow-y-auto survival-scroll space-y-4">
+            {(mpError || status === 'disconnected') && (
+              <div className="bg-red-950/60 border border-red-500/50 rounded-lg px-3.5 py-2.5 text-xs text-red-200 flex items-center justify-between gap-2">
+                <span>
+                  {mpError || 'Multiplayer server disconnected. Click Reconnect to rejoin the 16-player lobby.'}
+                </span>
+                {status === 'disconnected' && (
+                  <button
+                    onClick={onConnect}
+                    className="px-2.5 py-1 rounded bg-red-700 hover:bg-red-600 text-white font-semibold shrink-0 cursor-pointer"
+                  >
+                    Retry
+                  </button>
+                )}
+              </div>
+            )}
             {currentRoom ? (
               <div className="space-y-4">
                 <div className="bg-[#111723] border border-sky-500/40 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
@@ -406,7 +423,7 @@ export const MultiplayerModal: React.FC<Props> = ({
               </div>
               <div className="flex-1 overflow-y-auto survival-scroll space-y-1.5 pr-1">
                 {lobbyPlayers.map((p) => {
-                  const isSelf = p.playerId === saveData.profile.playerId;
+                  const isSelf = p.playerId === localPlayerId;
                   return (
                     <div
                       key={p.playerId}

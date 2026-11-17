@@ -35,7 +35,8 @@ export interface MultiplayerListener {
     damage: number,
     attackerX: number,
     attackerZ: number,
-    serverHealth: number
+    serverHealth: number,
+    serverArmor: number
   ) => void;
   onMatchEnded?: (
     winnerId: string | null,
@@ -46,9 +47,13 @@ export interface MultiplayerListener {
   onError?: (message: string) => void;
 }
 
+const TAB_ID_STORAGE_KEY = 'zs_mp_tab_id';
+
 export class MultiplayerClient {
   private ws: WebSocket | null = null;
   private profile: PlayerProfile;
+  private maxHealth = 120;
+  private readonly networkPlayerId: string;
   private status: MpConnectionStatus = 'disconnected';
   private listeners = new Set<MultiplayerListener>();
   private lastRoomId: string | null = null;
@@ -66,8 +71,32 @@ export class MultiplayerClient {
   currentRoom: MultiplayerRoomState | null = null;
   chatMessages: ChatMessage[] = [];
 
-  constructor(profile: PlayerProfile) {
+  constructor(profile: PlayerProfile, maxHealth = 120) {
     this.profile = { ...profile };
+    this.maxHealth = maxHealth;
+    this.networkPlayerId = this.resolveTabNetworkId(profile.playerId);
+  }
+
+  private resolveTabNetworkId(baseId: string): string {
+    if (typeof window === 'undefined') {
+      return `${baseId.slice(0, 12)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+    }
+    try {
+      const existing = window.sessionStorage.getItem(TAB_ID_STORAGE_KEY);
+      if (existing && existing.length >= 6) return existing.slice(0, 24);
+      const generated = `${baseId.slice(0, 12)}-${Math.random()
+        .toString(36)
+        .slice(2, 6)
+        .toUpperCase()}`;
+      window.sessionStorage.setItem(TAB_ID_STORAGE_KEY, generated);
+      return generated;
+    } catch {
+      return `${baseId.slice(0, 12)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+    }
+  }
+
+  getNetworkPlayerId(): string {
+    return this.networkPlayerId;
   }
 
   subscribe(listener: MultiplayerListener): () => void {
@@ -87,7 +116,8 @@ export class MultiplayerClient {
     return this.voiceDeafened;
   }
 
-  connect(): void {
+  connect(maxHealth?: number): void {
+    if (typeof maxHealth === 'number') this.maxHealth = maxHealth;
     if (typeof window === 'undefined') return;
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
@@ -104,11 +134,12 @@ export class MultiplayerClient {
       this.setStatus('connected');
       this.send({
         type: 'auth:hello',
-        playerId: this.profile.playerId,
+        playerId: this.networkPlayerId,
         username: this.profile.username,
         avatarId: this.profile.avatarId,
         level: this.profile.level,
         skin: this.profile.selectedCharacterSkin,
+        maxHealth: this.maxHealth,
         reconnectRoomId: this.lastRoomId ?? undefined,
       });
     };
@@ -166,14 +197,16 @@ export class MultiplayerClient {
     }
   }
 
-  updateProfile(profile: PlayerProfile): void {
+  updateProfile(profile: PlayerProfile, maxHealth?: number): void {
     this.profile = { ...profile };
+    if (typeof maxHealth === 'number') this.maxHealth = maxHealth;
     this.send({
       type: 'profile:update',
       username: profile.username,
       avatarId: profile.avatarId,
       level: profile.level,
       skin: profile.selectedCharacterSkin,
+      maxHealth: this.maxHealth,
     });
   }
 
@@ -226,8 +259,18 @@ export class MultiplayerClient {
     this.send({ type: 'match:player_state', ...payload });
   }
 
-  sendShotHit(zombieId: number, damage: number, headshot: boolean, weaponId: WeaponId): void {
-    this.send({ type: 'match:shot_hit', zombieId, damage, headshot, weaponId });
+  sendShotHit(
+    zombieId: number,
+    damage: number,
+    headshot: boolean,
+    weaponId: WeaponId,
+    source: 'weapon' | 'grenade' | 'turret' = 'weapon'
+  ): void {
+    this.send({ type: 'match:shot_hit', zombieId, damage, headshot, weaponId, source });
+  }
+
+  sendUseConsumable(kind: 'medkit' | 'armor'): void {
+    this.send({ type: kind === 'medkit' ? 'match:use_medkit' : 'match:use_armor' });
   }
 
   async toggleMicrophone(): Promise<boolean> {
@@ -266,9 +309,15 @@ export class MultiplayerClient {
   private connectSquadVoicePeers(): void {
     if (!this.currentRoom) return;
     for (const m of this.currentRoom.members) {
-      if (m.playerId === this.profile.playerId || this.peers.has(m.playerId)) continue;
+      if (m.playerId === this.networkPlayerId || this.peers.has(m.playerId)) continue;
       void this.initiatePeerOffer(m.playerId);
     }
+  }
+
+  private closeVoicePeers(): void {
+    this.peers.forEach((pc) => pc.close());
+    this.peers.clear();
+    document.querySelectorAll('audio[data-mp-voice="true"]').forEach((el) => el.remove());
   }
 
   private createPeerConnection(remoteId: string): RTCPeerConnection {
@@ -372,6 +421,11 @@ export class MultiplayerClient {
       case 'room:state':
         this.currentRoom = msg.room;
         this.lastRoomId = msg.room ? msg.room.roomId : null;
+        if (!msg.room) {
+          this.closeVoicePeers();
+        } else if (!this.micMuted) {
+          this.connectSquadVoicePeers();
+        }
         this.listeners.forEach((l) => l.onRoomUpdate?.(msg.room));
         break;
       case 'chat:message':
@@ -399,9 +453,15 @@ export class MultiplayerClient {
         );
         break;
       case 'match:player_damaged':
-        if (msg.targetPlayerId === this.profile.playerId) {
+        if (msg.targetPlayerId === this.networkPlayerId) {
           this.listeners.forEach((l) =>
-            l.onPlayerDamaged?.(msg.damage, msg.attackerX, msg.attackerZ, msg.health)
+            l.onPlayerDamaged?.(
+              msg.damage,
+              msg.attackerX,
+              msg.attackerZ,
+              msg.health,
+              msg.armor
+            )
           );
         }
         break;

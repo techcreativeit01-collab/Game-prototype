@@ -32,6 +32,7 @@ import { ARENA_RADIUS, ForestEnvironment, groundHeightAt } from './ForestEnviron
 import { PlayerController } from './PlayerController';
 import { ZombieInstance, ZombieManager } from './ZombieManager';
 import { EquipmentSystem } from './EquipmentSystem';
+import { BloodSystem } from './BloodSystem';
 import {
   HumanCharacterRig,
   animateHumanRig,
@@ -125,8 +126,10 @@ export interface GameEngineCallbacks {
     zombieId: number,
     damage: number,
     headshot: boolean,
-    weaponId: WeaponId
+    weaponId: WeaponId,
+    source?: 'weapon' | 'grenade' | 'turret'
   ) => void;
+  onMultiplayerUseConsumable?: (kind: 'medkit' | 'armor') => void;
 }
 
 const _v3A = new THREE.Vector3();
@@ -148,6 +151,7 @@ export class GameEngine {
   private player = new PlayerController();
   private zombies!: ZombieManager;
   private equipment!: EquipmentSystem;
+  private blood!: BloodSystem;
 
   // Main menu 3D character showcase
   private menuHero!: HumanCharacterRig;
@@ -157,6 +161,7 @@ export class GameEngine {
   // Multiplayer state & remote squadmates
   private gameMode: GameMode = 'solo';
   private localPlayerId = '';
+  private mpDowned = false;
   private remotePlayers = new Map<string, RemotePlayerVisual>();
   private latestSquadHUD: SquadMemberHUD[] = [];
   private mpStateSendTimer = 0;
@@ -363,10 +368,21 @@ export class GameEngine {
     );
     this.zombies = new ZombieManager(this.scene, this.forest.spawnPoints, this.textures);
     this.equipment = new EquipmentSystem(this.scene, this.textures.woodAlbedo);
+    this.blood = new BloodSystem(this.scene, this.settings.graphicsQuality === 'low' ? 60 : 110);
 
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
     }
+  }
+
+  private getBloodWallTargets(): THREE.Object3D[] {
+    if (this.equipment.barricades.length === 0) {
+      return this.forest.bulletBlockMeshes;
+    }
+    return [
+      ...this.forest.bulletBlockMeshes,
+      ...this.equipment.barricades.map((b) => b.mesh),
+    ];
   }
 
   private initMenuHero(): void {
@@ -555,6 +571,7 @@ export class GameEngine {
     this.player.reset(save.upgrades, this.settings.fov);
     this.zombies.reset(isMultiplayer);
     this.equipment.reset();
+    this.blood.clear();
     this.forest.clearSupplyDrop();
     this.resetAmmoPool();
     this.refreshViewModelCustomizations();
@@ -562,6 +579,7 @@ export class GameEngine {
     for (const pr of this.projectiles) this.scene.remove(pr.mesh);
     this.projectiles.length = 0;
 
+    this.mpDowned = false;
     this.kills = 0;
     this.sessionCoins = 0;
     this.sessionXp = 0;
@@ -589,7 +607,12 @@ export class GameEngine {
   }
 
   applyServerMatchSnapshot(snapshot: MultiplayerMatchSnapshot): void {
-    if (this.gameMode === 'solo' || this.screenMode !== 'playing') return;
+    if (
+      this.gameMode === 'solo' ||
+      (this.screenMode !== 'playing' && this.screenMode !== 'paused')
+    ) {
+      return;
+    }
 
     this.zombies.syncFromServerSnapshots(
       snapshot.zombies,
@@ -686,6 +709,16 @@ export class GameEngine {
         const idx = this.zombies.raycastTargets.indexOf(hm);
         if (idx !== -1) this.zombies.raycastTargets.splice(idx, 1);
       }
+      const burstOrigin = z.position.clone().add(new THREE.Vector3(0, 1.15 * z.scale, 0));
+      this.blood.spawnBloodImpact(
+        z.type,
+        burstOrigin,
+        new THREE.Vector3(0, -0.4, 0),
+        false,
+        this.getBloodWallTargets(),
+        this.settings.effectsQuality,
+        true
+      );
       this.audio.playZombieSound(z.type, z.position.distanceTo(this.player.position), true);
     }
 
@@ -702,20 +735,27 @@ export class GameEngine {
     damage: number,
     attackerX: number,
     attackerZ: number,
-    _serverHealth: number
+    serverHealth: number,
+    serverArmor?: number
   ): void {
-    if (this.screenMode !== 'playing') return;
+    if (this.screenMode !== 'playing' && this.screenMode !== 'paused') return;
     const save = this.progression.getData();
     this.player.takeDamage(
       damage,
       save.upgrades,
       new THREE.Vector3(attackerX, this.player.position.y, attackerZ)
     );
+    this.player.health = Math.max(0, serverHealth);
+    if (typeof serverArmor === 'number') {
+      this.player.armor = Math.max(0, serverArmor);
+    }
     this.audio.playZombieAttack();
     this.audio.playPlayerHurt();
     this.vibrate(85);
-    if (this.player.health <= 0) {
-      this.finishRun(false);
+    if (this.player.health <= 0 && !this.mpDowned) {
+      this.mpDowned = true;
+      this.callbacks.onToast('You are DOWNED — waiting for squad outcome or Pause to exit.', true);
+      this.emitHUD();
     }
   }
 
@@ -924,7 +964,7 @@ export class GameEngine {
   }
 
   useEquipment(itemId: EquipmentId): void {
-    if (this.screenMode !== 'playing') return;
+    if (this.screenMode !== 'playing' || this.mpDowned) return;
     const count = this.progression.getData().inventory[itemId] ?? 0;
     if (count <= 0) {
       this.callbacks.onToast('Out of item — buy more in Inventory.', true);
@@ -939,6 +979,9 @@ export class GameEngine {
           return;
         }
         this.progression.consumeInventoryItem(itemId);
+        if (this.gameMode !== 'solo') {
+          this.callbacks.onMultiplayerUseConsumable?.('medkit');
+        }
         this.audio.playPurchase(true);
         this.callbacks.onToast('+60 HP Restored');
         break;
@@ -949,6 +992,9 @@ export class GameEngine {
           return;
         }
         this.progression.consumeInventoryItem(itemId);
+        if (this.gameMode !== 'solo') {
+          this.callbacks.onMultiplayerUseConsumable?.('armor');
+        }
         this.audio.playReload();
         this.callbacks.onToast('+50 Kevlar Armor');
         break;
@@ -1209,14 +1255,14 @@ export class GameEngine {
       if (dot > 0.42 || dist < 1.25) {
         hitAny = true;
         const hitPos = z.position.clone().add(new THREE.Vector3(0, 1.3 * z.scale, 0));
-        this.spawnParticles(hitPos, 0x991b1b, 8, 4.5);
         this.emitDamageNumber(hitPos, damage, false);
 
+        let killedThis = false;
         if (this.gameMode !== 'solo') {
           this.zombies.applyLocalVisualHit(z);
-          this.callbacks.onMultiplayerShotHit?.(z.id, damage, false, WeaponId.KATANA);
+          this.callbacks.onMultiplayerShotHit?.(z.id, damage, false, WeaponId.KATANA, 'weapon');
         } else {
-          const killed = this.zombies.damageZombie(
+          killedThis = this.zombies.damageZombie(
             z,
             damage,
             (deadZ) => {
@@ -1226,8 +1272,18 @@ export class GameEngine {
             _v3B,
             5.2
           );
-          if (killed) killedAny = true;
+          if (killedThis) killedAny = true;
         }
+
+        this.blood.spawnBloodImpact(
+          z.type,
+          hitPos,
+          _v3B,
+          false,
+          this.getBloodWallTargets(),
+          this.settings.effectsQuality,
+          killedThis
+        );
       }
     }
 
@@ -1376,13 +1432,18 @@ export class GameEngine {
         const isHeadshot = Boolean(hit.object.userData.isHead);
         const dmg = isHeadshot ? Math.round(pr.damage * 1.75) : pr.damage;
 
-        this.spawnParticles(hit.point, isHeadshot ? 0xdc2626 : 0x881313, isHeadshot ? 10 : 6, 4.8);
         this.emitDamageNumber(hit.point, dmg, isHeadshot);
 
         let killed = false;
         if (this.gameMode !== 'solo') {
           this.zombies.applyLocalVisualHit(zombie);
-          this.callbacks.onMultiplayerShotHit?.(zombie.id, dmg, isHeadshot, this.currentWeaponId);
+          this.callbacks.onMultiplayerShotHit?.(
+            zombie.id,
+            dmg,
+            isHeadshot,
+            this.currentWeaponId,
+            'weapon'
+          );
         } else {
           this.zombies.damageZombie(
             zombie,
@@ -1395,6 +1456,16 @@ export class GameEngine {
             pr.knockback
           );
         }
+
+        this.blood.spawnBloodImpact(
+          zombie.type,
+          hit.point,
+          _v3A,
+          isHeadshot,
+          this.getBloodWallTargets(),
+          this.settings.effectsQuality,
+          killed
+        );
 
         this.audio.playBulletImpact('flesh', isHeadshot);
         this.audio.playHit(isHeadshot);
@@ -1842,14 +1913,20 @@ export class GameEngine {
 
     const kbX = (this.keys.has('KeyD') ? 1 : 0) - (this.keys.has('KeyA') ? 1 : 0);
     const kbZ = (this.keys.has('KeyW') ? 1 : 0) - (this.keys.has('KeyS') ? 1 : 0);
-    const inputX = THREE.MathUtils.clamp(kbX + this.mobileInput.moveX, -1, 1);
-    const inputZ = THREE.MathUtils.clamp(kbZ + this.mobileInput.moveZ, -1, 1);
+    const inputX = this.mpDowned
+      ? 0
+      : THREE.MathUtils.clamp(kbX + this.mobileInput.moveX, -1, 1);
+    const inputZ = this.mpDowned
+      ? 0
+      : THREE.MathUtils.clamp(kbZ + this.mobileInput.moveZ, -1, 1);
 
-    const wantJump = this.keys.has('Space') || this.keys.has('Space_MOBILE');
+    const wantJump =
+      !this.mpDowned && (this.keys.has('Space') || this.keys.has('Space_MOBILE'));
     const wantSprint =
-      this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') || this.mobileInput.sprint;
-    const wantCrouch = this.keys.has('KeyC') || this.mobileInput.crouch;
-    const isAiming = this.isCurrentlyAiming();
+      !this.mpDowned &&
+      (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') || this.mobileInput.sprint);
+    const wantCrouch = !this.mpDowned && (this.keys.has('KeyC') || this.mobileInput.crouch);
+    const isAiming = !this.mpDowned && this.isCurrentlyAiming();
 
     const save = this.progression.getData();
     const spec = WEAPONS_BY_ID[this.currentWeaponId];
@@ -1878,14 +1955,18 @@ export class GameEngine {
       () => this.audio.playSlide()
     );
 
-    this.handleCombatInput(dt);
+    if (!this.mpDowned) {
+      this.handleCombatInput(dt);
+    }
     this.animateWeaponViewModel(dt);
     this.updateBallisticProjectiles(dt);
     this.updateTargetZombieScan(dt);
+    this.blood.update(dt, this.settings.effectsQuality);
 
     // Update remote multiplayer squadmates interpolation & animation
     this.remotePlayers.forEach((rp) => {
       rp.curPos.lerp(rp.targetPos, Math.min(1, dt * 14));
+      rp.curPos.y = Math.max(rp.curPos.y, groundHeightAt(rp.curPos.x, rp.curPos.z));
       rp.rig.root.position.copy(rp.curPos);
       let diff = rp.targetYaw - rp.curYaw;
       while (diff > Math.PI) diff -= Math.PI * 2;
@@ -2018,7 +2099,22 @@ export class GameEngine {
         this.spawnTracer(from, to, 0xff8a3c);
         this.audio.playTurretFire();
       },
-      (deadZ) => this.handleZombieKilled(deadZ)
+      (deadZ) => this.handleZombieKilled(deadZ),
+      (z, dmg, dir, source, killed) => {
+        const hitPos = z.position.clone().add(new THREE.Vector3(0, 1.15 * z.scale, 0));
+        this.blood.spawnBloodImpact(
+          z.type,
+          hitPos,
+          dir,
+          false,
+          this.getBloodWallTargets(),
+          this.settings.effectsQuality,
+          killed
+        );
+        if (this.gameMode !== 'solo') {
+          this.callbacks.onMultiplayerShotHit?.(z.id, dmg, false, this.currentWeaponId, source);
+        }
+      }
     );
 
     // Zombies AI + Wave progression
@@ -2264,6 +2360,7 @@ export class GameEngine {
     (this.flashlightCone.material as THREE.Material).dispose();
     this.bulletGeo.dispose();
     this.bulletMat.dispose();
+    this.blood.dispose();
     this.zombies.dispose();
     this.forest.dispose();
     this.textures.dispose();
