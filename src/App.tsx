@@ -75,6 +75,10 @@ export default function App() {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [contextLost, setContextLost] = useState(false);
   const [isTouchEnv, setIsTouchEnv] = useState(false);
+  const [viewport, setViewport] = useState(() => ({
+    width: typeof window !== 'undefined' ? window.innerWidth : 1280,
+    height: typeof window !== 'undefined' ? window.innerHeight : 720,
+  }));
 
   // Multiplayer UI state
   const [mpStatus, setMpStatus] = useState<MpConnectionStatus>('disconnected');
@@ -96,17 +100,57 @@ export default function App() {
     }, 2600);
   }, []);
 
+  const attemptLandscapeLock = useCallback(async () => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+    const touchLike =
+      window.matchMedia('(pointer: coarse)').matches ||
+      'ontouchstart' in window ||
+      navigator.maxTouchPoints > 0;
+    if (!touchLike) return;
+
+    try {
+      const docEl = document.documentElement as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void>;
+      };
+      if (!document.fullscreenElement) {
+        if (docEl.requestFullscreen) {
+          await docEl.requestFullscreen().catch(() => {});
+        } else if (docEl.webkitRequestFullscreen) {
+          await docEl.webkitRequestFullscreen().catch(() => {});
+        }
+      }
+      const orient = window.screen.orientation as ScreenOrientation & {
+        lock?: (mode: 'landscape' | 'landscape-primary') => Promise<void>;
+      };
+      if (orient && typeof orient.lock === 'function') {
+        await orient.lock('landscape').catch(() => {});
+      }
+    } catch {
+      // Orientation lock blocked on unsupported browsers; CSS landscape fallback handles it automatically
+    }
+  }, []);
+
   useEffect(() => {
-    const detectTouch = () => {
+    const updateViewportAndTouch = () => {
+      const vv = window.visualViewport;
+      const w = Math.round(vv ? vv.width : window.innerWidth);
+      const h = Math.round(vv ? vv.height : window.innerHeight);
+      setViewport({ width: w, height: h });
       setIsTouchEnv(
         window.matchMedia('(pointer: coarse)').matches ||
           'ontouchstart' in window ||
           navigator.maxTouchPoints > 0
       );
     };
-    detectTouch();
-    window.addEventListener('resize', detectTouch);
-    return () => window.removeEventListener('resize', detectTouch);
+    updateViewportAndTouch();
+    window.addEventListener('resize', updateViewportAndTouch);
+    window.addEventListener('orientationchange', updateViewportAndTouch);
+    window.visualViewport?.addEventListener('resize', updateViewportAndTouch);
+    return () => {
+      window.removeEventListener('resize', updateViewportAndTouch);
+      window.removeEventListener('orientationchange', updateViewportAndTouch);
+      window.visualViewport?.removeEventListener('resize', updateViewportAndTouch);
+    };
   }, []);
 
   useEffect(() => {
@@ -156,6 +200,7 @@ export default function App() {
       },
       onMatchStarted: (_roomId, mode) => {
         audioMgr.unlock();
+        void attemptLandscapeLock();
         setActiveModal(null);
         setGameOverStats(null);
         setMpError(null);
@@ -193,7 +238,7 @@ export default function App() {
       unsub();
       mpClient.disconnect();
     };
-  }, [mpClient, audioMgr, progression, pushToast]);
+  }, [mpClient, audioMgr, progression, pushToast, attemptLandscapeLock]);
 
   // Mount isolated 3D GameEngine once
   useEffect(() => {
@@ -244,14 +289,33 @@ export default function App() {
     settings.mobileControls === 'always' ||
     (settings.mobileControls === 'auto' && isTouchEnv);
 
+  const isPortrait = viewport.height > viewport.width;
+  const isRotatedLandscape = isTouchEnv && isPortrait;
+  const stageStyle: React.CSSProperties = isRotatedLandscape
+    ? {
+        position: 'fixed',
+        top: '50%',
+        left: '50%',
+        width: `${viewport.height}px`,
+        height: `${viewport.width}px`,
+        transform: 'translate(-50%, -50%) rotate(90deg)',
+        transformOrigin: 'center center',
+      }
+    : {
+        position: 'relative',
+        width: '100%',
+        height: '100%',
+      };
+
   const handlePlaySolo = useCallback(() => {
     audioMgr.unlock();
     audioMgr.playUIClick();
+    void attemptLandscapeLock();
     setActiveModal(null);
     setGameOverStats(null);
     setScreen('playing');
     engineRef.current?.startNewGame();
-  }, [audioMgr]);
+  }, [audioMgr, attemptLandscapeLock]);
 
   const handlePause = useCallback(() => {
     audioMgr.playUIClick();
@@ -374,12 +438,23 @@ export default function App() {
   };
 
   return (
-    <div className="relative w-full h-full overflow-hidden bg-[#07090d]">
-      {/* Isolated WebGL Viewport Container */}
+    <div
+      className="relative w-full h-full overflow-hidden bg-[#07090d]"
+      onPointerDown={() => {
+        if (isTouchEnv && isPortrait) {
+          void attemptLandscapeLock();
+        }
+      }}
+    >
       <div
-        ref={canvasMountRef}
-        className="absolute inset-0 w-full h-full game-touch-surface"
-      />
+        style={stageStyle}
+        className="overflow-hidden bg-[#07090d]"
+      >
+        {/* Isolated WebGL Viewport Container */}
+        <div
+          ref={canvasMountRef}
+          className="absolute inset-0 w-full h-full game-touch-surface"
+        />
 
       {contextLost && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#06080c]/95 text-center p-6">
@@ -460,6 +535,7 @@ export default function App() {
             <MobileControls
               hud={hud}
               settings={settings}
+              isRotatedLandscape={isRotatedLandscape}
               onMobileInput={(p) => engineRef.current?.setMobileInput(p)}
               onLookDelta={(dx, dy) => engineRef.current?.triggerMobileLook(dx, dy)}
               onFireStart={() => engineRef.current?.triggerMobileFire()}
@@ -686,6 +762,7 @@ export default function App() {
           ))}
         </div>
       )}
+      </div>
     </div>
   );
 }

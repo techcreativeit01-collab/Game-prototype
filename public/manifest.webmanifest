@@ -1,0 +1,10 @@
+{
+  "name": "ZOMBIE SHOOTER — 3D FPS Survival",
+  "short_name": "ZOMBIE SHOOTER",
+  "description": "3D First-Person Zombie Survival Shooter set in a dark moonlit forest.",
+  "start_url": "/",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#07090d",
+  "theme_color": "#07090d"
+}

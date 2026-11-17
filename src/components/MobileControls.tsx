@@ -16,6 +16,7 @@ import { MobileInputState } from '../engine/GameEngine';
 interface Props {
   hud: HUDState;
   settings: SettingsData;
+  isRotatedLandscape?: boolean;
   onMobileInput: (partial: Partial<MobileInputState>) => void;
   onLookDelta: (dx: number, dy: number) => void;
   onFireStart: () => void;
@@ -30,6 +31,7 @@ interface Props {
 export const MobileControls: React.FC<Props> = ({
   hud,
   settings,
+  isRotatedLandscape = false,
   onMobileInput,
   onLookDelta,
   onFireStart,
@@ -90,9 +92,15 @@ export const MobileControls: React.FC<Props> = ({
     }
   };
 
+  const mapDelta = (rawDx: number, rawDy: number): { dx: number; dy: number } => {
+    if (!isRotatedLandscape) return { dx: rawDx, dy: rawDy };
+    return { dx: rawDy, dy: -rawDx };
+  };
+
   const updateJoystick = (cx: number, cy: number) => {
-    let dx = cx - joyCenter.current.x;
-    let dy = cy - joyCenter.current.y;
+    const rawDx = cx - joyCenter.current.x;
+    const rawDy = cy - joyCenter.current.y;
+    let { dx, dy } = mapDelta(rawDx, rawDy);
     const dist = Math.hypot(dx, dy);
     if (dist > maxRadius) {
       dx = (dx / dist) * maxRadius;
@@ -121,9 +129,10 @@ export const MobileControls: React.FC<Props> = ({
     for (let i = 0; i < e.changedTouches.length; i++) {
       const t = e.changedTouches[i];
       if (t.identifier === lookTouchId.current) {
-        const dx = t.clientX - lastLookPos.current.x;
-        const dy = t.clientY - lastLookPos.current.y;
+        const rawDx = t.clientX - lastLookPos.current.x;
+        const rawDy = t.clientY - lastLookPos.current.y;
         lastLookPos.current = { x: t.clientX, y: t.clientY };
+        const { dx, dy } = mapDelta(rawDx, rawDy);
         onLookDelta(dx, dy);
       }
     }
@@ -152,9 +161,10 @@ export const MobileControls: React.FC<Props> = ({
     for (let i = 0; i < e.changedTouches.length; i++) {
       const t = e.changedTouches[i];
       if (t.identifier === fireDragTouchId.current) {
-        const dx = t.clientX - lastFireDragPos.current.x;
-        const dy = t.clientY - lastFireDragPos.current.y;
+        const rawDx = t.clientX - lastFireDragPos.current.x;
+        const rawDy = t.clientY - lastFireDragPos.current.y;
         lastFireDragPos.current = { x: t.clientX, y: t.clientY };
+        const { dx, dy } = mapDelta(rawDx, rawDy);
         onLookDelta(dx, dy);
       }
     }

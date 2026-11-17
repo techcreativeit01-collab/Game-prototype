@@ -2318,8 +2318,14 @@ export class GameEngine {
     this.callbacks.onContextLost(false);
   };
 
+  private resizeObserver: ResizeObserver | null = null;
+
   private bindEvents(): void {
     window.addEventListener('resize', this.onResize);
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => this.onResize());
+      this.resizeObserver.observe(this.container);
+    }
     window.addEventListener('deviceorientation', this.onDeviceOrientation);
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
@@ -2339,6 +2345,8 @@ export class GameEngine {
     cancelAnimationFrame(this.frameId);
     clearTimeout(this.frameId);
 
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
     window.removeEventListener('resize', this.onResize);
     window.removeEventListener('deviceorientation', this.onDeviceOrientation);
     window.removeEventListener('keydown', this.onKeyDown);
