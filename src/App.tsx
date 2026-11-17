@@ -649,7 +649,7 @@ export default function App() {
           rooms={rooms}
           currentRoom={currentRoom}
           chatMessages={chatMessages}
-          onConnect={() => mpClient.connect()}
+          onConnect={() => mpClient.reconnect()}
           onOpenProfile={() => {
             audioMgr.playUIClick();
             setActiveModal('profile');

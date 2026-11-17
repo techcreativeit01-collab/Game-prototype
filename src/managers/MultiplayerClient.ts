@@ -79,6 +79,7 @@ const HEARTBEAT_INTERVAL_MS = 10000;
 const HEARTBEAT_TIMEOUT_MS = 18000;
 const MAX_RECONNECT_ATTEMPTS = 12;
 const MAX_QUEUED_CONTROLS = 20;
+const DEFAULT_RENDER_WS_URL = 'wss://zombie-shooter-server-i03r.onrender.com/ws';
 
 const QUEUEABLE_CONTROL_TYPES = new Set<ClientToServerMsg['type']>([
   'profile:update',
@@ -111,6 +112,7 @@ export class MultiplayerClient {
   private lastPongAt = 0;
   private manuallyClosed = false;
   private browserEventsBound = false;
+  private fallbackToRenderDefault = false;
   private pendingControlQueue: ClientToServerMsg[] = [];
 
   // Perfect Negotiation WebRTC peer mesh for squad voice chat
@@ -255,11 +257,12 @@ export class MultiplayerClient {
     }
   }
 
-  private resolveWebSocketUrl(): string {
-    const rawOverride = (
-      (import.meta as unknown as { env?: Record<string, string | undefined> }).env
-        ?.VITE_MULTIPLAYER_WS_URL || ''
-    ).trim();
+  private resolveWebSocketUrl(): { url: string; source: 'env' | 'localhost' | 'render-default' } {
+    if (this.fallbackToRenderDefault) {
+      return { url: DEFAULT_RENDER_WS_URL, source: 'render-default' };
+    }
+
+    const rawOverride = (import.meta.env.VITE_MULTIPLAYER_WS_URL ?? '').trim();
 
     if (rawOverride) {
       let normalized = rawOverride.replace(/\/+$/, '');
@@ -274,11 +277,54 @@ export class MultiplayerClient {
       if (!normalized.endsWith('/ws')) {
         normalized = `${normalized}/ws`;
       }
-      return normalized;
+
+      try {
+        const parsed = new URL(normalized);
+        if (
+          parsed.hostname === 'zombie-shooter-server.onrender.com' ||
+          parsed.hostname.endsWith('.vercel.app')
+        ) {
+          console.warn(
+            `[Multiplayer] Ignoring invalid/unreachable VITE_MULTIPLAYER_WS_URL "${normalized}"; using live Render backend ${DEFAULT_RENDER_WS_URL}`
+          );
+          return { url: DEFAULT_RENDER_WS_URL, source: 'render-default' };
+        }
+      } catch {
+        // Invalid URL format will be handled cleanly by new WebSocket() try/catch
+      }
+
+      return { url: normalized, source: 'env' };
     }
 
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${window.location.host}/ws`;
+    const host = window.location.hostname;
+    if (host === 'localhost' || host === '127.0.0.1') {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return { url: `${proto}//${window.location.host}/ws`, source: 'localhost' };
+    }
+
+    return { url: DEFAULT_RENDER_WS_URL, source: 'render-default' };
+  }
+
+  getWebSocketUrl(): string {
+    if (typeof window === 'undefined') return DEFAULT_RENDER_WS_URL;
+    return this.resolveWebSocketUrl().url;
+  }
+
+  reconnect(): void {
+    this.clearReconnectTimer();
+    this.reconnectAttempts = 0;
+    this.fallbackToRenderDefault = false;
+    this.manuallyClosed = false;
+    if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+      const stale = this.ws;
+      this.ws = null;
+      try {
+        stale.close(4002, 'Manual reconnect requested');
+      } catch {
+        // ignore close error on pending socket
+      }
+    }
+    this.connect();
   }
 
   connect(maxHealth?: number): void {
@@ -299,12 +345,35 @@ export class MultiplayerClient {
     this.authenticated = false;
     this.setStatus('connecting');
 
-    const wsUrl = this.resolveWebSocketUrl();
-    const ws = new WebSocket(wsUrl);
+    const { url: wsUrl, source } = this.resolveWebSocketUrl();
+    if (source === 'render-default') {
+      console.warn(
+        `[Multiplayer] VITE_MULTIPLAYER_WS_URL is not set; using Render backend ${wsUrl}`
+      );
+    } else {
+      console.info(`[Multiplayer] Connecting to WebSocket (${source}): ${wsUrl}`);
+    }
+
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[Multiplayer] Invalid WebSocket URL "${wsUrl}":`, err);
+      this.ws = null;
+      this.setStatus('disconnected');
+      this.listeners.forEach((l) =>
+        l.onError?.(`Invalid multiplayer WebSocket URL (${wsUrl}): ${errMsg}`)
+      );
+      return;
+    }
+
     this.ws = ws;
+    let hadSocketError = false;
 
     ws.onopen = () => {
       if (this.ws !== ws) return;
+      console.info(`[Multiplayer] WebSocket connected: ${wsUrl}`);
       this.lastPongAt = Date.now();
       this.startHeartbeat(ws);
       this.sendHello();
@@ -316,24 +385,58 @@ export class MultiplayerClient {
       try {
         const msg = JSON.parse(String(evt.data)) as ServerToClientMsg;
         this.handleServerMessage(msg);
-      } catch {
-        // ignore malformed packets
+      } catch (err) {
+        console.warn('[Multiplayer] Ignored malformed WebSocket message:', err);
       }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (this.ws !== ws) return;
+      const wasAuthed = this.authenticated;
       this.stopHeartbeat();
       this.authenticated = false;
       this.ws = null;
       this.setStatus('disconnected');
+
+      console.warn('[Multiplayer] WebSocket closed', {
+        url: wsUrl,
+        code: event.code,
+        reason: event.reason || '(none)',
+        wasClean: event.wasClean,
+        wasAuthenticated: wasAuthed,
+      });
+
       if (!this.manuallyClosed) {
+        if (
+          !wasAuthed &&
+          (hadSocketError || event.code === 1006) &&
+          source === 'env' &&
+          wsUrl !== DEFAULT_RENDER_WS_URL
+        ) {
+          console.warn(
+            `[Multiplayer] Primary WS URL ${wsUrl} failed before auth; falling back to ${DEFAULT_RENDER_WS_URL}`
+          );
+          this.fallbackToRenderDefault = true;
+        }
+        if (hadSocketError || !event.wasClean || event.code === 1006) {
+          const detail = event.reason ? ` (${event.code}: ${event.reason})` : ` (code ${event.code})`;
+          this.listeners.forEach((l) =>
+            l.onError?.(
+              `Unable to reach multiplayer server at ${wsUrl}${detail}. Retrying...`
+            )
+          );
+        }
         this.scheduleReconnect();
       }
     };
 
-    ws.onerror = () => {
-      // handled cleanly by onclose
+    ws.onerror = (event) => {
+      if (this.ws !== ws) return;
+      hadSocketError = true;
+      console.error(`[Multiplayer] WebSocket connection error on ${wsUrl}`, {
+        readyState: ws.readyState,
+        event,
+      });
     };
   }
 
@@ -386,6 +489,7 @@ export class MultiplayerClient {
         return;
       }
       if (Date.now() - this.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+        console.warn('[Multiplayer] Heartbeat timeout; closing stale WebSocket');
         this.stopHeartbeat();
         ws.close(4001, 'Heartbeat timeout');
         return;
@@ -404,8 +508,14 @@ export class MultiplayerClient {
   private scheduleReconnect(): void {
     if (this.reconnectTimer !== null || this.manuallyClosed) return;
     if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      const wsUrl = this.resolveWebSocketUrl().url;
+      console.error(
+        `[Multiplayer] Reconnect aborted after ${MAX_RECONNECT_ATTEMPTS} attempts (${wsUrl})`
+      );
       this.listeners.forEach((l) =>
-        l.onError?.('Connection lost after multiple retries. Check network or reconnect.')
+        l.onError?.(
+          `Connection to ${wsUrl} failed after ${MAX_RECONNECT_ATTEMPTS} retries. Click Reconnect to try again.`
+        )
       );
       return;
     }
@@ -413,6 +523,9 @@ export class MultiplayerClient {
     const baseDelay = Math.min(15000, 1000 * Math.pow(2, this.reconnectAttempts));
     const jitteredDelay = Math.round(baseDelay * (0.75 + Math.random() * 0.5));
     this.reconnectAttempts++;
+    console.info(
+      `[Multiplayer] Scheduling reconnect attempt ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${jitteredDelay}ms`
+    );
 
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
@@ -890,6 +1003,11 @@ export class MultiplayerClient {
         } else if (msg.reconnectedRoomId) {
           this.persistRoomId(msg.reconnectedRoomId);
         }
+        console.info('[Multiplayer] Authenticated', {
+          playerId: msg.playerId,
+          authMode: this.authMode,
+          reconnectedRoomId: msg.reconnectedRoomId ?? null,
+        });
         this.setStatus('connected');
         this.listeners.forEach((l) => l.onAuthModeChange?.(this.authMode, this.verifiedUserId));
         this.flushPendingControls();
@@ -963,6 +1081,7 @@ export class MultiplayerClient {
         void this.handleRtcSignal(msg.fromPlayerId, msg.payload);
         break;
       case 'error':
+        console.error('[Multiplayer] Server error:', msg.message);
         this.listeners.forEach((l) => l.onError?.(msg.message));
         break;
     }
