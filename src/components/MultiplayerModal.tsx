@@ -27,12 +27,15 @@ interface Props {
   saveData: SaveData;
   localPlayerId: string;
   status: MpConnectionStatus;
+  authMode?: 'supabase' | 'guest';
+  cloudEmail?: string | null;
   mpError?: string | null;
   lobbyPlayers: LobbyPlayer[];
   rooms: MultiplayerRoomState[];
   currentRoom: MultiplayerRoomState | null;
   chatMessages: ChatMessage[];
   onConnect: () => void;
+  onOpenProfile?: () => void;
   onQuickMatch: (mode: 'coop' | 'competitive') => void;
   onCreateRoom: (name: string, mode: 'coop' | 'competitive') => void;
   onJoinRoom: (codeOrId: string) => void;
@@ -48,12 +51,15 @@ export const MultiplayerModal: React.FC<Props> = ({
   saveData,
   localPlayerId,
   status,
+  authMode = 'guest',
+  cloudEmail,
   mpError,
   lobbyPlayers,
   rooms,
   currentRoom,
   chatMessages,
   onConnect,
+  onOpenProfile,
   onQuickMatch,
   onCreateRoom,
   onJoinRoom,
@@ -97,6 +103,20 @@ export const MultiplayerModal: React.FC<Props> = ({
             </p>
           </div>
           <div className="flex items-center gap-3">
+            {onOpenProfile && (
+              <button
+                onClick={onOpenProfile}
+                className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-semibold border cursor-pointer ${
+                  authMode === 'supabase'
+                    ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300'
+                    : 'bg-[#151b26] border-white/10 text-slate-300 hover:text-white'
+                }`}
+              >
+                {authMode === 'supabase'
+                  ? `Cloud: ${cloudEmail || 'Verified'}`
+                  : 'Guest · Sign In'}
+              </button>
+            )}
             <span
               className={`text-xs font-mono-tabular font-semibold ${
                 status === 'connected'
@@ -134,6 +154,11 @@ export const MultiplayerModal: React.FC<Props> = ({
         <div className="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-12">
           {/* Left 7 cols: Room Management / Squad Staging */}
           <div className="lg:col-span-7 p-5 overflow-y-auto survival-scroll space-y-4">
+            {status === 'connecting' && (
+              <div className="bg-amber-950/40 border border-amber-500/40 rounded-lg px-3.5 py-2 text-xs text-amber-200">
+                Waking & connecting to WebSocket server... Free-tier servers may take ~20–30s after idle sleep.
+              </div>
+            )}
             {(mpError || status === 'disconnected') && (
               <div className="bg-red-950/60 border border-red-500/50 rounded-lg px-3.5 py-2.5 text-xs text-red-200 flex items-center justify-between gap-2">
                 <span>
@@ -432,8 +457,13 @@ export const MultiplayerModal: React.FC<Props> = ({
                       <div className="flex items-center gap-2 min-w-0">
                         <AvatarBadge avatarId={p.avatarId} size={28} />
                         <div className="min-w-0">
-                          <div className="text-xs font-semibold text-slate-100 truncate">
-                            {p.username} {isSelf ? '(You)' : ''}
+                          <div className="text-xs font-semibold text-slate-100 truncate flex items-center gap-1.5">
+                            <span className="truncate">{p.username} {isSelf ? '(You)' : ''}</span>
+                            {p.verified && (
+                              <span className="text-[9px] font-mono-tabular text-emerald-400 uppercase">
+                                Cloud
+                              </span>
+                            )}
                           </div>
                           <div className="text-[10px] font-mono-tabular text-slate-400">
                             Lv.{p.level} · {p.status}

@@ -17,7 +17,7 @@ import {
   WeaponId,
   WeaponSkinId,
 } from './types/game';
-import { ProgressionManager } from './managers/EconomyManager';
+import { CloudSyncStatus, ProgressionManager } from './managers/EconomyManager';
 import { SettingsManager } from './managers/SettingsManager';
 import { AudioManager } from './managers/AudioManager';
 import {
@@ -25,6 +25,14 @@ import {
   MpConnectionStatus,
   MultiplayerClient,
 } from './managers/MultiplayerClient';
+import {
+  getCurrentSupabaseSession,
+  isSupabaseConfigured,
+  signInWithEmail,
+  signOutSupabase,
+  signUpWithEmail,
+  subscribeSupabaseAuth,
+} from './lib/supabase';
 import { WEAPON_LIST } from './data/WeaponData';
 import { GameEngine } from './engine/GameEngine';
 import { LoadingScreen } from './components/LoadingScreen';
@@ -80,9 +88,14 @@ export default function App() {
     height: typeof window !== 'undefined' ? window.innerHeight : 720,
   }));
 
-  // Multiplayer UI state
+  // Multiplayer & Supabase Cloud UI state
   const [mpStatus, setMpStatus] = useState<MpConnectionStatus>('disconnected');
+  const [mpAuthMode, setMpAuthMode] = useState<'supabase' | 'guest'>('guest');
   const [mpError, setMpError] = useState<string | null>(null);
+  const [cloudEmail, setCloudEmail] = useState<string | null>(null);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<CloudSyncStatus>(() =>
+    progression.getCloudSyncStatus()
+  );
   const [lobbyPlayers, setLobbyPlayers] = useState<LobbyPlayer[]>([]);
   const [rooms, setRooms] = useState<MultiplayerRoomState[]>([]);
   const [currentRoom, setCurrentRoom] = useState<MultiplayerRoomState | null>(null);
@@ -163,6 +176,9 @@ export default function App() {
         mpClient.updateProfile(next.profile, maxHp);
       }
     });
+    const unsubCloud = progression.subscribeCloudSync((nextStatus) => {
+      setCloudSyncStatus(nextStatus);
+    });
     const unsubSettings = settingsMgr.subscribe((next) => {
       setSettings(next);
       audioMgr.updateSettings(next);
@@ -171,9 +187,45 @@ export default function App() {
     });
     return () => {
       unsubSave();
+      unsubCloud();
       unsubSettings();
     };
   }, [progression, settingsMgr, audioMgr, mpClient]);
+
+  // Supabase Free Authentication & Cloud Save Binding
+  useEffect(() => {
+    if (!isSupabaseConfigured()) return;
+    let cancelled = false;
+
+    const applySession = async (
+      session: { user: { id: string; email?: string; user_metadata?: Record<string, unknown> }; accessToken: string } | null
+    ) => {
+      if (cancelled) return;
+      if (session) {
+        setCloudEmail(session.user.email ?? 'Verified Operator');
+        mpClient.setAccessToken(session.accessToken);
+        const preferredName =
+          typeof session.user.user_metadata?.username === 'string'
+            ? session.user.user_metadata.username
+            : undefined;
+        await progression.bindCloudUser(session.user.id, preferredName);
+      } else {
+        setCloudEmail(null);
+        mpClient.setAccessToken(null);
+        await progression.bindCloudUser(null);
+      }
+    };
+
+    void getCurrentSupabaseSession().then((sess) => applySession(sess));
+    const unsubAuth = subscribeSupabaseAuth((sess) => {
+      void applySession(sess);
+    });
+
+    return () => {
+      cancelled = true;
+      unsubAuth();
+    };
+  }, [mpClient, progression]);
 
   // Multiplayer WebSocket subscription
   useEffect(() => {
@@ -181,6 +233,9 @@ export default function App() {
       onStatusChange: (status) => {
         setMpStatus(status);
         if (status === 'connected') setMpError(null);
+      },
+      onAuthModeChange: (mode) => {
+        setMpAuthMode(mode);
       },
       onLobbyUpdate: (players, nextRooms) => {
         setLobbyPlayers(players);
@@ -587,12 +642,18 @@ export default function App() {
           saveData={saveData}
           localPlayerId={mpClient.getNetworkPlayerId()}
           status={mpStatus}
+          authMode={mpAuthMode}
+          cloudEmail={cloudEmail}
           mpError={mpError}
           lobbyPlayers={lobbyPlayers}
           rooms={rooms}
           currentRoom={currentRoom}
           chatMessages={chatMessages}
           onConnect={() => mpClient.connect()}
+          onOpenProfile={() => {
+            audioMgr.playUIClick();
+            setActiveModal('profile');
+          }}
           onQuickMatch={(mode) => {
             setMpError(null);
             mpClient.quickMatch(mode);
@@ -679,12 +740,33 @@ export default function App() {
       {activeModal === 'profile' && (
         <ProfileModal
           saveData={saveData}
+          cloudConfigured={isSupabaseConfigured()}
+          cloudEmail={cloudEmail}
+          cloudSyncStatus={cloudSyncStatus}
           onUpdateProfile={(partial) => {
             const res = progression.updateProfile(partial);
             audioMgr.playPurchase(res.success);
             pushToast(res.message, !res.success);
           }}
           onSelectSkin={handleCharacterSkin}
+          onSignIn={async (email, password) => {
+            const res = await signInWithEmail(email, password);
+            if (res.ok) pushToast(res.message);
+            return { ok: res.ok, message: res.message };
+          }}
+          onSignUp={async (email, password, username) => {
+            const res = await signUpWithEmail(email, password, username);
+            if (res.ok) pushToast(res.message);
+            return { ok: res.ok, message: res.message };
+          }}
+          onSignOut={async () => {
+            await signOutSupabase();
+            pushToast('Signed out from cloud account');
+          }}
+          onSyncNow={async () => {
+            const ok = await progression.syncCloudNow();
+            pushToast(ok ? 'Cloud save synced' : 'Cloud sync failed', !ok);
+          }}
           onClose={() => {
             audioMgr.playUIClick();
             setActiveModal(null);

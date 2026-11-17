@@ -347,13 +347,11 @@ function validateProfile(raw: unknown, unlockedSkins: CharacterSkinId[]): Player
 }
 
 export class SaveManager {
-  static load(): SaveData {
+  static validateRaw(parsedInput: unknown): SaveData {
     const def = getDefaultSaveData();
     try {
-      const rawStr = localStorage.getItem(SAVE_STORAGE_KEY);
-      if (!rawStr) return def;
-      const parsed = JSON.parse(rawStr);
-      if (!parsed || typeof parsed !== 'object') return def;
+      if (!parsedInput || typeof parsedInput !== 'object') return def;
+      const parsed = parsedInput as Record<string, unknown>;
 
       const unlockedSet = new Set<WeaponId>([WeaponId.KATANA]);
       if (Array.isArray(parsed.unlockedWeapons)) {
@@ -372,15 +370,17 @@ export class SaveManager {
 
       const weaponLevels = { ...def.weaponLevels };
       if (parsed.weaponLevels && typeof parsed.weaponLevels === 'object') {
+        const wl = parsed.weaponLevels as Record<string, unknown>;
         for (const id of Object.values(WeaponId)) {
-          weaponLevels[id] = Math.floor(clampNum(parsed.weaponLevels[id], 1, 10, 1));
+          weaponLevels[id] = Math.floor(clampNum(wl[id], 1, 10, 1));
         }
       }
 
       const unlockedAttachments: Partial<Record<WeaponId, AttachmentId[]>> = {};
       if (parsed.unlockedAttachments && typeof parsed.unlockedAttachments === 'object') {
+        const ua = parsed.unlockedAttachments as Record<string, unknown>;
         for (const wid of Object.values(WeaponId)) {
-          const arr = parsed.unlockedAttachments[wid];
+          const arr = ua[wid];
           if (Array.isArray(arr)) {
             unlockedAttachments[wid] = arr.filter(
               (a): a is AttachmentId => typeof a === 'string' && a in ATTACHMENTS_BY_ID
@@ -391,8 +391,9 @@ export class SaveManager {
 
       const equippedAttachments: Partial<Record<WeaponId, AttachmentId[]>> = {};
       if (parsed.equippedAttachments && typeof parsed.equippedAttachments === 'object') {
+        const ea = parsed.equippedAttachments as Record<string, unknown>;
         for (const wid of Object.values(WeaponId)) {
-          const arr = parsed.equippedAttachments[wid];
+          const arr = ea[wid];
           const owned = unlockedAttachments[wid] ?? [];
           if (Array.isArray(arr)) {
             equippedAttachments[wid] = arr.filter(
@@ -413,8 +414,9 @@ export class SaveManager {
 
       const equippedWeaponSkins: Partial<Record<WeaponId, WeaponSkinId>> = {};
       if (parsed.equippedWeaponSkins && typeof parsed.equippedWeaponSkins === 'object') {
+        const ews = parsed.equippedWeaponSkins as Record<string, unknown>;
         for (const wid of Object.values(WeaponId)) {
-          const s = parsed.equippedWeaponSkins[wid];
+          const s = ews[wid];
           if (typeof s === 'string' && weaponSkinSet.has(s as WeaponSkinId)) {
             equippedWeaponSkins[wid] = s as WeaponSkinId;
           }
@@ -433,18 +435,20 @@ export class SaveManager {
 
       const upgrades = { ...def.upgrades };
       if (parsed.upgrades && typeof parsed.upgrades === 'object') {
+        const upg = parsed.upgrades as Record<string, unknown>;
         for (const id of Object.values(UpgradeId)) {
           const maxL = UPGRADES_BY_ID[id].maxLevel;
-          upgrades[id] = Math.floor(clampNum(parsed.upgrades[id], 0, maxL, 0));
+          upgrades[id] = Math.floor(clampNum(upg[id], 0, maxL, 0));
         }
       }
 
       const inventory = { ...def.inventory };
       if (parsed.inventory && typeof parsed.inventory === 'object') {
+        const inv = parsed.inventory as Record<string, unknown>;
         for (const id of Object.values(EquipmentId)) {
           const maxStack = ITEMS_BY_ID[id].maxStack;
           inventory[id] = Math.floor(
-            clampNum(parsed.inventory[id], 0, maxStack, def.inventory[id])
+            clampNum(inv[id], 0, maxStack, def.inventory[id])
           );
         }
       }
@@ -471,6 +475,89 @@ export class SaveManager {
         bestSurvivalTime: clampNum(parsed.bestSurvivalTime, 0, 999999, 0),
         settings: validateSettings(parsed.settings),
       };
+    } catch {
+      return def;
+    }
+  }
+
+  static mergeSaves(local: SaveData, cloud: SaveData): SaveData {
+    // Prefer cloud profile identity/XP if cloud has played games or higher level
+    const cloudHasMoreProgress =
+      cloud.totalKills > local.totalKills ||
+      cloud.gamesPlayed > local.gamesPlayed ||
+      cloud.profile.level > local.profile.level;
+    const primary = cloudHasMoreProgress ? cloud : local;
+
+    const unlockedWeapons = Array.from(
+      new Set<WeaponId>([...local.unlockedWeapons, ...cloud.unlockedWeapons])
+    );
+    const unlockedWeaponSkins = Array.from(
+      new Set<WeaponSkinId>([...local.unlockedWeaponSkins, ...cloud.unlockedWeaponSkins])
+    );
+    const unlockedCharacterSkins = Array.from(
+      new Set<CharacterSkinId>([
+        ...local.unlockedCharacterSkins,
+        ...cloud.unlockedCharacterSkins,
+      ])
+    );
+
+    const weaponLevels = { ...primary.weaponLevels };
+    for (const id of Object.values(WeaponId)) {
+      weaponLevels[id] = Math.max(local.weaponLevels[id] ?? 1, cloud.weaponLevels[id] ?? 1);
+    }
+
+    const upgrades = { ...primary.upgrades };
+    for (const id of Object.values(UpgradeId)) {
+      upgrades[id] = Math.max(local.upgrades[id] ?? 0, cloud.upgrades[id] ?? 0);
+    }
+
+    const unlockedAttachments: Partial<Record<WeaponId, AttachmentId[]>> = {};
+    for (const wid of Object.values(WeaponId)) {
+      const merged = Array.from(
+        new Set<AttachmentId>([
+          ...(local.unlockedAttachments[wid] ?? []),
+          ...(cloud.unlockedAttachments[wid] ?? []),
+        ])
+      );
+      if (merged.length > 0) unlockedAttachments[wid] = merged;
+    }
+
+    return {
+      ...primary,
+      coins: Math.max(local.coins, cloud.coins),
+      gems: Math.max(local.gems, cloud.gems),
+      unlockedWeapons,
+      weaponLevels,
+      unlockedAttachments,
+      unlockedWeaponSkins,
+      unlockedCharacterSkins,
+      upgrades,
+      highestWave: Math.max(local.highestWave, cloud.highestWave),
+      totalKills: Math.max(local.totalKills, cloud.totalKills),
+      totalCoinsEarned: Math.max(local.totalCoinsEarned, cloud.totalCoinsEarned),
+      gamesPlayed: Math.max(local.gamesPlayed, cloud.gamesPlayed),
+      bestSurvivalTime: Math.max(local.bestSurvivalTime, cloud.bestSurvivalTime),
+      profile: {
+        ...primary.profile,
+        matchesPlayed: Math.max(local.profile.matchesPlayed, cloud.profile.matchesPlayed),
+        matchesWon: Math.max(local.profile.matchesWon, cloud.profile.matchesWon),
+        totalPlaytimeSec: Math.max(
+          local.profile.totalPlaytimeSec,
+          cloud.profile.totalPlaytimeSec
+        ),
+      },
+      // Preserve local device graphics/controls settings
+      settings: local.settings,
+    };
+  }
+
+  static load(): SaveData {
+    const def = getDefaultSaveData();
+    try {
+      const rawStr = localStorage.getItem(SAVE_STORAGE_KEY);
+      if (!rawStr) return def;
+      const parsed = JSON.parse(rawStr);
+      return SaveManager.validateRaw(parsed);
     } catch {
       return def;
     }

@@ -25,6 +25,7 @@ export interface MatchStartMeta {
 
 export interface MultiplayerListener {
   onStatusChange?: (status: MpConnectionStatus) => void;
+  onAuthModeChange?: (mode: 'supabase' | 'guest', verifiedUserId: string | null) => void;
   onLobbyUpdate?: (players: LobbyPlayer[], rooms: MultiplayerRoomState[]) => void;
   onRoomUpdate?: (room: MultiplayerRoomState | null) => void;
   onChatMessage?: (msg: ChatMessage) => void;
@@ -99,6 +100,9 @@ export class MultiplayerClient {
   private readonly networkPlayerId: string;
   private status: MpConnectionStatus = 'disconnected';
   private authenticated = false;
+  private accessToken: string | null = null;
+  private authMode: 'supabase' | 'guest' = 'guest';
+  private verifiedUserId: string | null = null;
   private listeners = new Set<MultiplayerListener>();
   private lastRoomId: string | null = null;
   private reconnectTimer: number | null = null;
@@ -182,6 +186,22 @@ export class MultiplayerClient {
     return this.status;
   }
 
+  getAuthMode(): 'supabase' | 'guest' {
+    return this.authMode;
+  }
+
+  getVerifiedUserId(): string | null {
+    return this.verifiedUserId;
+  }
+
+  setAccessToken(token: string | null): void {
+    const changed = this.accessToken !== token;
+    this.accessToken = token;
+    if (changed && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.sendHello();
+    }
+  }
+
   isMicActive(): boolean {
     return !this.micMuted;
   }
@@ -235,6 +255,32 @@ export class MultiplayerClient {
     }
   }
 
+  private resolveWebSocketUrl(): string {
+    const rawOverride = (
+      (import.meta as unknown as { env?: Record<string, string | undefined> }).env
+        ?.VITE_MULTIPLAYER_WS_URL || ''
+    ).trim();
+
+    if (rawOverride) {
+      let normalized = rawOverride.replace(/\/+$/, '');
+      if (normalized.startsWith('https://')) {
+        normalized = `wss://${normalized.slice('https://'.length)}`;
+      } else if (normalized.startsWith('http://')) {
+        normalized = `ws://${normalized.slice('http://'.length)}`;
+      } else if (!normalized.startsWith('ws://') && !normalized.startsWith('wss://')) {
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        normalized = `${proto}//${normalized}`;
+      }
+      if (!normalized.endsWith('/ws')) {
+        normalized = `${normalized}/ws`;
+      }
+      return normalized;
+    }
+
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${proto}//${window.location.host}/ws`;
+  }
+
   connect(maxHealth?: number): void {
     if (typeof maxHealth === 'number') this.maxHealth = maxHealth;
     if (typeof window === 'undefined') return;
@@ -253,8 +299,7 @@ export class MultiplayerClient {
     this.authenticated = false;
     this.setStatus('connecting');
 
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${window.location.host}/ws`;
+    const wsUrl = this.resolveWebSocketUrl();
     const ws = new WebSocket(wsUrl);
     this.ws = ws;
 
@@ -262,16 +307,7 @@ export class MultiplayerClient {
       if (this.ws !== ws) return;
       this.lastPongAt = Date.now();
       this.startHeartbeat(ws);
-      this.sendRaw({
-        type: 'auth:hello',
-        playerId: this.networkPlayerId,
-        username: this.profile.username,
-        avatarId: this.profile.avatarId,
-        level: this.profile.level,
-        skin: this.profile.selectedCharacterSkin,
-        maxHealth: this.maxHealth,
-        reconnectRoomId: this.lastRoomId ?? undefined,
-      });
+      this.sendHello();
     };
 
     ws.onmessage = (evt) => {
@@ -299,6 +335,20 @@ export class MultiplayerClient {
     ws.onerror = () => {
       // handled cleanly by onclose
     };
+  }
+
+  private sendHello(): void {
+    this.sendRaw({
+      type: 'auth:hello',
+      playerId: this.networkPlayerId,
+      username: this.profile.username,
+      avatarId: this.profile.avatarId,
+      level: this.profile.level,
+      skin: this.profile.selectedCharacterSkin,
+      maxHealth: this.maxHealth,
+      reconnectRoomId: this.lastRoomId ?? undefined,
+      accessToken: this.accessToken ?? undefined,
+    });
   }
 
   disconnect(): void {
@@ -833,12 +883,15 @@ export class MultiplayerClient {
       case 'auth:welcome':
         this.authenticated = true;
         this.reconnectAttempts = 0;
+        this.authMode = msg.authMode ?? 'guest';
+        this.verifiedUserId = msg.verifiedUserId ?? null;
         if (msg.reconnectedRoomId === null) {
           this.persistRoomId(null);
         } else if (msg.reconnectedRoomId) {
           this.persistRoomId(msg.reconnectedRoomId);
         }
         this.setStatus('connected');
+        this.listeners.forEach((l) => l.onAuthModeChange?.(this.authMode, this.verifiedUserId));
         this.flushPendingControls();
         break;
       case 'pong':

@@ -22,6 +22,9 @@ import {
   getXpForNextLevel,
 } from '../data/GameData';
 import { SaveManager } from './SaveManager';
+import { fetchCloudSave, upsertCloudSave } from '../lib/supabase';
+
+export type CloudSyncStatus = 'local' | 'syncing' | 'synced' | 'error';
 
 export interface ActionResult {
   success: boolean;
@@ -32,6 +35,10 @@ export class ProgressionManager {
   private data: SaveData;
   private rewardedZombieIds = new Set<number>();
   private listeners = new Set<(data: SaveData) => void>();
+  private cloudSyncListeners = new Set<(status: CloudSyncStatus) => void>();
+  private cloudUserId: string | null = null;
+  private cloudSyncStatus: CloudSyncStatus = 'local';
+  private cloudSaveTimer: number | null = null;
 
   constructor() {
     this.data = SaveManager.load();
@@ -41,14 +48,99 @@ export class ProgressionManager {
     return this.data;
   }
 
+  getCloudSyncStatus(): CloudSyncStatus {
+    return this.cloudSyncStatus;
+  }
+
   subscribe(cb: (data: SaveData) => void): () => void {
     this.listeners.add(cb);
     return () => this.listeners.delete(cb);
   }
 
-  private emitAndSave(): void {
+  subscribeCloudSync(cb: (status: CloudSyncStatus) => void): () => void {
+    this.cloudSyncListeners.add(cb);
+    return () => this.cloudSyncListeners.delete(cb);
+  }
+
+  private setCloudSyncStatus(next: CloudSyncStatus): void {
+    this.cloudSyncStatus = next;
+    this.cloudSyncListeners.forEach((cb) => cb(next));
+  }
+
+  async bindCloudUser(userId: string | null, preferredUsername?: string): Promise<boolean> {
+    if (this.cloudSaveTimer !== null) {
+      clearTimeout(this.cloudSaveTimer);
+      this.cloudSaveTimer = null;
+    }
+    this.cloudUserId = userId;
+    if (!userId) {
+      this.setCloudSyncStatus('local');
+      return false;
+    }
+
+    this.setCloudSyncStatus('syncing');
+    try {
+      const rawCloud = await fetchCloudSave(userId);
+      if (rawCloud) {
+        const validatedCloud = SaveManager.validateRaw(rawCloud);
+        const merged = SaveManager.mergeSaves(this.data, validatedCloud);
+        this.data = merged;
+        SaveManager.save(this.data);
+        this.listeners.forEach((cb) => cb(this.data));
+      } else if (preferredUsername && this.data.profile.username === 'Survivor') {
+        this.data = {
+          ...this.data,
+          profile: {
+            ...this.data.profile,
+            username: preferredUsername.trim().slice(0, 16) || 'Survivor',
+          },
+        };
+        SaveManager.save(this.data);
+        this.listeners.forEach((cb) => cb(this.data));
+      }
+
+      const res = await upsertCloudSave(userId, this.data);
+      this.setCloudSyncStatus(res.ok ? 'synced' : 'error');
+      return res.ok;
+    } catch {
+      this.setCloudSyncStatus('error');
+      return false;
+    }
+  }
+
+  async syncCloudNow(): Promise<boolean> {
+    if (!this.cloudUserId) return false;
+    if (this.cloudSaveTimer !== null) {
+      clearTimeout(this.cloudSaveTimer);
+      this.cloudSaveTimer = null;
+    }
+    this.setCloudSyncStatus('syncing');
+    const res = await upsertCloudSave(this.cloudUserId, this.data);
+    this.setCloudSyncStatus(res.ok ? 'synced' : 'error');
+    return res.ok;
+  }
+
+  private scheduleCloudUpsert(immediate = false): void {
+    if (!this.cloudUserId || typeof window === 'undefined') return;
+    if (this.cloudSaveTimer !== null) {
+      clearTimeout(this.cloudSaveTimer);
+      this.cloudSaveTimer = null;
+    }
+    if (immediate) {
+      void this.syncCloudNow();
+      return;
+    }
+    this.setCloudSyncStatus('syncing');
+    this.cloudSaveTimer = window.setTimeout(() => {
+      this.cloudSaveTimer = null;
+      void this.syncCloudNow();
+    }, 1200);
+  }
+
+  private emitAndSave(immediateCloud = false): void {
     SaveManager.save(this.data);
     this.listeners.forEach((cb) => cb(this.data));
+    this.scheduleCloudUpsert(immediateCloud);
   }
 
   resetSessionTracking(): void {
@@ -451,7 +543,7 @@ export class ProgressionManager {
         matchesWon: this.data.profile.matchesWon + (won ? 1 : 0),
       },
     };
-    this.emitAndSave();
+    this.emitAndSave(true);
     return isNewRecord;
   }
 
@@ -466,5 +558,6 @@ export class ProgressionManager {
   resetSaveData(): void {
     this.data = SaveManager.resetAll();
     this.listeners.forEach((cb) => cb(this.data));
+    this.scheduleCloudUpsert(true);
   }
 }

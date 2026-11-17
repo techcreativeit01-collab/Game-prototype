@@ -1,6 +1,9 @@
+import 'dotenv/config';
+import fs from 'fs';
 import http from 'http';
 import path from 'path';
 import express from 'express';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { WebSocketServer, WebSocket } from 'ws';
 import type {
   CharacterSkinId,
@@ -20,6 +23,30 @@ const PORT = Number(process.env.PORT || 3000);
 const LOBBY_CAPACITY = 16;
 const MAX_ROOM_PLAYERS = 4;
 const ARENA_RADIUS = 52;
+const CORS_ORIGIN = (process.env.CORS_ORIGIN || '*').trim();
+
+const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim();
+const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const SUPABASE_ANON_KEY = (
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.VITE_SUPABASE_ANON_KEY ||
+  ''
+).trim();
+
+const supabaseAdmin: SupabaseClient | null =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      })
+    : null;
+
+const supabaseAuthVerifier: SupabaseClient | null =
+  supabaseAdmin ||
+  (SUPABASE_URL && SUPABASE_ANON_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      })
+    : null);
 
 const ZOMBIE_BASE_STATS: Record<
   ZombieType,
@@ -47,6 +74,8 @@ const WEAPON_MAX_SINGLE_SHOT_DMG: Record<WeaponId, number> = {
 interface ClientSession {
   ws: WebSocket;
   playerId: string;
+  verifiedUserId: string | null;
+  authMode: 'supabase' | 'guest';
   username: string;
   avatarId: number;
   level: number;
@@ -154,6 +183,7 @@ function broadcastLobbyState(): void {
           : 'room'
         : 'lobby',
       roomId: c.roomId,
+      verified: c.authMode === 'supabase',
     });
   });
 
@@ -453,6 +483,34 @@ function finishRoomMatch(room: RoomRuntime, winnerId: string | null, reason: str
     bonusXp,
   });
 
+  // Persist authoritative match summary to Supabase Postgres when configured
+  if (supabaseAdmin) {
+    const matchPlayers = Array.from(room.players.values()).map((p) => ({
+      playerId: p.playerId,
+      userId: clients.get(p.playerId)?.verifiedUserId ?? null,
+      username: p.username,
+      kills: p.kills,
+      score: p.score,
+      alive: p.alive,
+    }));
+    const winnerUserId = winnerId ? clients.get(winnerId)?.verifiedUserId ?? null : null;
+    void supabaseAdmin
+      .from('match_results')
+      .insert({
+        room_id: room.state.roomId,
+        mode: room.state.mode,
+        wave_reached: room.wave,
+        winner_user_id: winnerUserId,
+        reason,
+        players: matchPlayers,
+      })
+      .then(({ error }) => {
+        if (error) {
+          console.error('Supabase match_results insert failed:', error.message);
+        }
+      });
+  }
+
   // Reset room to waiting for replay or cleanup if empty
   setTimeout(() => {
     const r = rooms.get(room.state.roomId);
@@ -593,6 +651,16 @@ function joinRoomForSession(session: ClientSession, roomCodeOrId: string): void 
 async function bootstrapServer() {
   const app = express();
   app.use(express.json());
+  app.use((_req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (_req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
 
   app.get('/api/health', (_req, res) => {
     res.json({
@@ -600,6 +668,13 @@ async function bootstrapServer() {
       playersOnline: clients.size,
       activeRooms: rooms.size,
       lobbyCapacity: LOBBY_CAPACITY,
+      maxRoomPlayers: MAX_ROOM_PLAYERS,
+      supabaseConfigured: Boolean(supabaseAuthVerifier),
+      persistenceMode: supabaseAdmin
+        ? 'supabase-postgres'
+        : supabaseAuthVerifier
+        ? 'supabase-client-rls'
+        : 'local-only',
     });
   });
 
@@ -612,10 +687,23 @@ async function bootstrapServer() {
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
+    const indexHtmlPath = path.join(distDir, 'index.html');
+    if (fs.existsSync(indexHtmlPath)) {
+      app.use(express.static(distDir));
+      app.get('*', (_req, res) => {
+        res.sendFile(indexHtmlPath);
+      });
+    } else {
+      app.get('/', (_req, res) => {
+        res.json({
+          ok: true,
+          service: 'zombie-shooter-multiplayer',
+          wsPath: '/ws',
+          playersOnline: clients.size,
+          activeRooms: rooms.size,
+        });
+      });
+    }
   }
 
   const server = http.createServer(app);
@@ -634,42 +722,73 @@ async function bootstrapServer() {
 
   wss.on('connection', (ws) => {
     let session: ClientSession | null = null;
+    let authInFlight = false;
+    const preAuthQueue: ClientToServerMsg[] = [];
 
-    ws.on('message', (rawBuf) => {
-      let msg: ClientToServerMsg;
-      try {
-        msg = JSON.parse(rawBuf.toString()) as ClientToServerMsg;
-      } catch {
-        return;
-      }
-
+    const dispatchMessage = async (msg: ClientToServerMsg): Promise<void> => {
       if (msg.type === 'auth:hello') {
         const pid = (msg.playerId || `OP-${Math.random().toString(36).slice(2, 8)}`).slice(0, 24);
         const existing = clients.get(pid);
+        if (!existing && clients.size >= LOBBY_CAPACITY) {
+          sendTo(ws, {
+            type: 'error',
+            message: `Lobby is full (${LOBBY_CAPACITY}/${LOBBY_CAPACITY} players online). Try again shortly.`,
+          });
+          ws.close(4003, 'Lobby full');
+          return;
+        }
+
+        let verifiedUserId: string | null = null;
+        let authMode: 'supabase' | 'guest' = 'guest';
+        if (msg.accessToken && supabaseAuthVerifier) {
+          try {
+            const { data, error } = await supabaseAuthVerifier.auth.getUser(msg.accessToken);
+            if (!error && data.user) {
+              verifiedUserId = data.user.id;
+              authMode = 'supabase';
+            }
+          } catch {
+            // Fall back to guest session if verification fails transiently
+          }
+        }
+
+        if (ws.readyState !== WebSocket.OPEN) return;
+
         if (existing && existing.ws !== ws && existing.ws.readyState === WebSocket.OPEN) {
           existing.ws.close(4000, 'Replaced by newer connection');
         }
         const safeMaxHp = Math.max(100, Math.min(320, Math.round(Number(msg.maxHealth) || 120)));
+        const preservedRoomId =
+          session?.roomId ??
+          (existing && existing.roomId && rooms.has(existing.roomId) ? existing.roomId : null);
+
         session = {
           ws,
           playerId: pid,
+          verifiedUserId,
+          authMode,
           username: (msg.username || 'Survivor').slice(0, 16),
           avatarId: Number(msg.avatarId) || 0,
           level: Math.max(1, Number(msg.level) || 1),
           skin: msg.skin || 'ranger',
           maxHealth: safeMaxHp,
-          roomId: null,
+          roomId: preservedRoomId,
         };
         clients.set(pid, session);
 
         // Reconnect recovery into active room if present
+        const candidateRoomId = msg.reconnectRoomId || preservedRoomId;
         let reconnectedRoomId: string | null = null;
-        if (msg.reconnectRoomId && rooms.has(msg.reconnectRoomId)) {
-          const r = rooms.get(msg.reconnectRoomId)!;
+        if (candidateRoomId && rooms.has(candidateRoomId)) {
+          const r = rooms.get(candidateRoomId)!;
           const member = r.state.members.find((m) => m.playerId === pid);
           if (member && r.state.status !== 'ended') {
             reconnectedRoomId = r.state.roomId;
             member.connected = true;
+            member.username = session.username;
+            member.avatarId = session.avatarId;
+            member.level = session.level;
+            member.skin = session.skin;
             session.roomId = r.state.roomId;
             const mp = r.players.get(pid);
             if (mp) mp.disconnectedAt = null;
@@ -681,6 +800,8 @@ async function bootstrapServer() {
           playerId: pid,
           lobbyCapacity: LOBBY_CAPACITY,
           reconnectedRoomId,
+          authMode,
+          verifiedUserId,
         });
 
         if (reconnectedRoomId) {
@@ -937,6 +1058,34 @@ async function bootstrapServer() {
           break;
         }
       }
+    };
+
+    ws.on('message', (rawBuf) => {
+      let msg: ClientToServerMsg;
+      try {
+        msg = JSON.parse(rawBuf.toString()) as ClientToServerMsg;
+      } catch {
+        return;
+      }
+
+      if (msg.type === 'auth:hello') {
+        authInFlight = true;
+        void dispatchMessage(msg).finally(() => {
+          authInFlight = false;
+          while (preAuthQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
+            const queued = preAuthQueue.shift()!;
+            void dispatchMessage(queued);
+          }
+        });
+        return;
+      }
+
+      if (authInFlight) {
+        if (preAuthQueue.length < 32) preAuthQueue.push(msg);
+        return;
+      }
+
+      void dispatchMessage(msg);
     });
 
     ws.on('close', () => {

@@ -418,6 +418,7 @@ export interface LobbyPlayer {
   skin: CharacterSkinId;
   status: 'lobby' | 'room' | 'in-match';
   roomId: string | null;
+  verified?: boolean;
 }
 
 export interface ChatMessage {
@@ -511,6 +512,7 @@ export type ClientToServerMsg =
       skin: CharacterSkinId;
       maxHealth?: number;
       reconnectRoomId?: string;
+      accessToken?: string;
     }
   | {
       type: 'profile:update';
@@ -561,6 +563,8 @@ export type ServerToClientMsg =
       playerId: string;
       lobbyCapacity: number;
       reconnectedRoomId?: string | null;
+      authMode?: 'supabase' | 'guest';
+      verifiedUserId?: string | null;
     }
   | { type: 'lobby:state'; players: LobbyPlayer[]; rooms: MultiplayerRoomState[] }
   | { type: 'chat:message'; message: ChatMessage }
