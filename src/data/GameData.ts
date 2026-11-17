@@ -1,4 +1,6 @@
 import {
+  CharacterSkinId,
+  CharacterSkinSpec,
   EquipmentId,
   InventoryItemSpec,
   UpgradeId,
@@ -182,6 +184,90 @@ export const ITEMS_BY_ID: Record<EquipmentId, InventoryItemSpec> = INVENTORY_ITE
   {} as Record<EquipmentId, InventoryItemSpec>
 );
 
+export const CHARACTER_SKINS: CharacterSkinSpec[] = [
+  {
+    id: 'ranger',
+    name: 'Forest Ranger',
+    description: 'Olive drab field jacket, ballistic vest, and woodland patrol trousers.',
+    priceCoins: 0,
+    priceGems: 0,
+    primaryHex: 0x334131,
+    secondaryHex: 0x202429,
+    accentHex: 0x8b6b47,
+    swatchCss: 'linear-gradient(135deg, #3c4f38, #1e2428)',
+  },
+  {
+    id: 'night_ops',
+    name: 'Night Ops Recon',
+    description: 'Stealth midnight charcoal combat rig with cyan tactical visor.',
+    priceCoins: 480,
+    priceGems: 0,
+    primaryHex: 0x1a1f29,
+    secondaryHex: 0x0e1117,
+    accentHex: 0x38bdf8,
+    swatchCss: 'linear-gradient(135deg, #1e293b, #0ea5e9)',
+  },
+  {
+    id: 'crimson',
+    name: 'Crimson Vanguard',
+    description: 'Heavy blood-red kevlar shoulder plates with blackened urban camo.',
+    priceCoins: 820,
+    priceGems: 15,
+    primaryHex: 0x5c191d,
+    secondaryHex: 0x18191f,
+    accentHex: 0xef4444,
+    swatchCss: 'linear-gradient(135deg, #991b1b, #18181b)',
+  },
+  {
+    id: 'arctic',
+    name: 'Arctic Ghost',
+    description: 'Frost-grey winter combat parka with titanium chest rig.',
+    priceCoins: 680,
+    priceGems: 10,
+    primaryHex: 0x8d9aa8,
+    secondaryHex: 0x2e3744,
+    accentHex: 0xe2e8f0,
+    swatchCss: 'linear-gradient(135deg, #cbd5e1, #475569)',
+  },
+  {
+    id: 'gold',
+    name: 'Apex Commander',
+    description: 'Elite carbon-weave battle suit trimmed with gold command plates.',
+    priceCoins: 1800,
+    priceGems: 40,
+    primaryHex: 0x23201b,
+    secondaryHex: 0x141311,
+    accentHex: 0xfbbf24,
+    swatchCss: 'linear-gradient(135deg, #f59e0b, #1c1917)',
+  },
+];
+
+export const CHARACTER_SKINS_BY_ID: Record<CharacterSkinId, CharacterSkinSpec> =
+  CHARACTER_SKINS.reduce(
+    (acc, s) => {
+      acc[s.id] = s;
+      return acc;
+    },
+    {} as Record<CharacterSkinId, CharacterSkinSpec>
+  );
+
+export interface AvatarPreset {
+  id: number;
+  label: string;
+  bg: string;
+  visor: string;
+  trim: string;
+}
+
+export const AVATAR_PRESETS: AvatarPreset[] = [
+  { id: 0, label: 'Ranger', bg: '#1c2b22', visor: '#ef4444', trim: '#84cc16' },
+  { id: 1, label: 'Specter', bg: '#162235', visor: '#38bdf8', trim: '#60a5fa' },
+  { id: 2, label: 'Reaper', bg: '#2b1318', visor: '#fb7185', trim: '#f43f5e' },
+  { id: 3, label: 'Vanguard', bg: '#2c2214', visor: '#fbbf24', trim: '#f59e0b' },
+  { id: 4, label: 'Wolf', bg: '#1f242d', visor: '#e2e8f0', trim: '#94a3b8' },
+  { id: 5, label: 'Biohazard', bg: '#182b18', visor: '#4ade80', trim: '#22c55e' },
+];
+
 export interface ZombieClassConfig {
   type: ZombieType;
   label: string;
@@ -192,6 +278,7 @@ export interface ZombieClassConfig {
   attackRange: number;
   attackCooldown: number;
   coinReward: number;
+  xpReward: number;
   scale: number;
   bodyColor: number;
   clothColor: number;
@@ -209,6 +296,7 @@ export const ZOMBIE_CONFIGS: Record<ZombieType, ZombieClassConfig> = {
     attackRange: 1.85,
     attackCooldown: 1.15,
     coinReward: 18,
+    xpReward: 22,
     scale: 1.0,
     bodyColor: 0x5c6858,
     clothColor: 0x2b3038,
@@ -224,6 +312,7 @@ export const ZOMBIE_CONFIGS: Record<ZombieType, ZombieClassConfig> = {
     attackRange: 1.7,
     attackCooldown: 0.78,
     coinReward: 24,
+    xpReward: 28,
     scale: 0.94,
     bodyColor: 0x6f5a52,
     clothColor: 0x3b2323,
@@ -239,6 +328,7 @@ export const ZOMBIE_CONFIGS: Record<ZombieType, ZombieClassConfig> = {
     attackRange: 2.35,
     attackCooldown: 1.65,
     coinReward: 55,
+    xpReward: 70,
     scale: 1.38,
     bodyColor: 0x454e45,
     clothColor: 0x1e2226,
@@ -254,6 +344,7 @@ export const ZOMBIE_CONFIGS: Record<ZombieType, ZombieClassConfig> = {
     attackRange: 1.8,
     attackCooldown: 0.95,
     coinReward: 28,
+    xpReward: 34,
     scale: 0.96,
     bodyColor: 0x6c7274,
     clothColor: 0x3a2634,
@@ -269,6 +360,7 @@ export const ZOMBIE_CONFIGS: Record<ZombieType, ZombieClassConfig> = {
     attackRange: 2.6,
     attackCooldown: 1.45,
     coinReward: 220,
+    xpReward: 250,
     scale: 1.68,
     bodyColor: 0x3b2d2d,
     clothColor: 0x171215,
@@ -283,6 +375,10 @@ export function getWaveZombieCount(wave: number): number {
   if (wave === 4) return 60;
   if (wave === 5) return 100;
   return Math.min(240, 100 + (wave - 5) * 28);
+}
+
+export function getXpForNextLevel(level: number): number {
+  return Math.round(180 * Math.pow(1.22, Math.max(0, level - 1)));
 }
 
 export const INVENTORY_MAX_CAPACITY = 30;

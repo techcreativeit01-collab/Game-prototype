@@ -10,10 +10,11 @@ export const HowToPlayModal: React.FC<Props> = ({ onClose }) => {
     ['W A S D', 'Move across forest terrain'],
     ['Mouse', 'Look around (click viewport to lock cursor)'],
     ['Left Click', 'Swing Katana / Fire firearm'],
-    ['Right Click', 'Aim down sights (tighter spread)'],
-    ['Space', 'Jump'],
+    ['Right Click', 'Aim down sights / Sniper Scope (M107)'],
+    ['Space', 'Jump (with coyote time & buffering)'],
     ['Shift', 'Sprint (uses stamina)'],
-    ['C', 'Crouch'],
+    ['C / Shift + C', 'Crouch / Tactical Sprint Slide'],
+    ['L', 'Toggle tactical weapon flashlight'],
     ['R', 'Reload firearm'],
     ['1 – 9 / Wheel', 'Switch unlocked weapons'],
     ['E', 'Pick up nearby loot drops'],
@@ -23,12 +24,13 @@ export const HowToPlayModal: React.FC<Props> = ({ onClose }) => {
   ];
 
   const mobileControls: Array<[string, string]> = [
-    ['Left Joystick', 'Move and strafe'],
-    ['Right Touch Area', 'Drag to aim and look around'],
-    ['FIRE / AIM', 'Shoot or swing Katana / toggle precision aim'],
-    ['JUMP / SPRINT / CROUCH', 'Traversal & stance toggles'],
-    ['< Weapon >', 'Cycle unlocked weapons'],
-    ['Reload / Frag / Medkit', 'Quick combat actions'],
+    ['Left Joystick', 'Move, strafe, and push up to Auto-Sprint'],
+    ['Right Touch Area', 'Drag anywhere to aim and look around'],
+    ['FIRE (Drag-Aim)', 'Hold & drag thumb to track infected while firing'],
+    ['L-FIRE / AIM', 'Left-thumb claw fire / Precision ADS toggle'],
+    ['JUMP / SPRINT / SLIDE', 'Traversal, crouch & tactical sprint-slide'],
+    ['Flashlight / < Weapon >', 'Toggle beam & cycle/select unlocked weapons'],
+    ['Tactical Tray', 'Reload, Frag, Medkit, Ammo, Barricade & Turret'],
   ];
 
   return (

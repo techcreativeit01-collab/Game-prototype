@@ -1,7 +1,13 @@
-import { SettingsData } from '../types/game';
-import { getDefaultSettings } from './SaveManager';
+import { GraphicsQuality, SettingsData } from '../types/game';
+import {
+  detectRecommendedQuality,
+  getDefaultSettings,
+  getGraphicsPresetOverrides,
+} from './SaveManager';
 
 type SettingsListener = (settings: SettingsData) => void;
+
+export { detectRecommendedQuality, getGraphicsPresetOverrides };
 
 export class SettingsManager {
   private settings: SettingsData;
@@ -18,6 +24,13 @@ export class SettingsManager {
   update(next: SettingsData): void {
     this.settings = { ...next };
     this.listeners.forEach((cb) => cb(this.get()));
+  }
+
+  applyQualityPreset(quality: GraphicsQuality): SettingsData {
+    const overrides = getGraphicsPresetOverrides(quality);
+    this.settings = { ...this.settings, ...overrides };
+    this.listeners.forEach((cb) => cb(this.get()));
+    return this.get();
   }
 
   resetToDefaults(): SettingsData {
