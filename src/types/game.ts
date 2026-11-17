@@ -465,6 +465,7 @@ export interface RemotePlayerSnapshot {
   pitch: number;
   health: number;
   maxHealth: number;
+  armor?: number;
   alive: boolean;
   isMoving: boolean;
   isSprinting: boolean;
@@ -551,15 +552,28 @@ export type ClientToServerMsg =
     }
   | { type: 'match:use_medkit' }
   | { type: 'match:use_armor' }
-  | { type: 'rtc:signal'; targetPlayerId: string; payload: unknown };
+  | { type: 'rtc:signal'; targetPlayerId: string; payload: unknown }
+  | { type: 'ping' };
 
 export type ServerToClientMsg =
-  | { type: 'auth:welcome'; playerId: string; lobbyCapacity: number }
+  | {
+      type: 'auth:welcome';
+      playerId: string;
+      lobbyCapacity: number;
+      reconnectedRoomId?: string | null;
+    }
   | { type: 'lobby:state'; players: LobbyPlayer[]; rooms: MultiplayerRoomState[] }
   | { type: 'chat:message'; message: ChatMessage }
   | { type: 'lobby:invited'; fromName: string; roomCode: string; roomName: string }
   | { type: 'room:state'; room: MultiplayerRoomState | null }
-  | { type: 'match:started'; roomId: string; mode: 'coop' | 'competitive' }
+  | {
+      type: 'match:started';
+      roomId: string;
+      mode: 'coop' | 'competitive';
+      isReconnect?: boolean;
+      spawnX?: number;
+      spawnZ?: number;
+    }
   | { type: 'match:snapshot'; snapshot: MultiplayerMatchSnapshot }
   | { type: 'match:zombie_killed'; zombieId: number; killerId: string; coinReward: number; xpReward: number }
   | {
@@ -573,4 +587,5 @@ export type ServerToClientMsg =
     }
   | { type: 'match:ended'; winnerId: string | null; reason: string; bonusCoins: number; bonusXp: number }
   | { type: 'rtc:signal'; fromPlayerId: string; payload: unknown }
+  | { type: 'pong'; serverTime: number }
   | { type: 'error'; message: string };

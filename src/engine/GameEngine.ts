@@ -162,6 +162,7 @@ export class GameEngine {
   private gameMode: GameMode = 'solo';
   private localPlayerId = '';
   private mpDowned = false;
+  private mpNeedsSnapshotSync = false;
   private remotePlayers = new Map<string, RemotePlayerVisual>();
   private latestSquadHUD: SquadMemberHUD[] = [];
   private mpStateSendTimer = 0;
@@ -552,15 +553,36 @@ export class GameEngine {
   startNewGame(): void {
     this.gameMode = 'solo';
     this.localPlayerId = this.progression.getData().profile.playerId;
+    this.mpNeedsSnapshotSync = false;
     this.clearRemotePlayers();
     this.initRunCommon(false);
   }
 
-  startMultiplayerGame(mode: 'coop' | 'competitive', localPlayerId: string): void {
+  startMultiplayerGame(
+    mode: 'coop' | 'competitive',
+    localPlayerId: string,
+    options?: { isReconnect?: boolean; spawnX?: number; spawnZ?: number }
+  ): void {
+    if (
+      options?.isReconnect &&
+      (this.screenMode === 'playing' || this.screenMode === 'paused') &&
+      this.gameMode === mode
+    ) {
+      this.localPlayerId = localPlayerId;
+      this.mpNeedsSnapshotSync = false;
+      return;
+    }
+
     this.gameMode = mode;
     this.localPlayerId = localPlayerId;
+    this.mpNeedsSnapshotSync = Boolean(options?.isReconnect);
     this.clearRemotePlayers();
     this.initRunCommon(true);
+
+    if (typeof options?.spawnX === 'number' && typeof options?.spawnZ === 'number') {
+      const gy = groundHeightAt(options.spawnX, options.spawnZ);
+      this.player.position.set(options.spawnX, gy, options.spawnZ);
+    }
   }
 
   private initRunCommon(isMultiplayer: boolean): void {
@@ -639,6 +661,20 @@ export class GameEngine {
       });
 
       if (p.playerId === this.localPlayerId) {
+        if (this.mpNeedsSnapshotSync) {
+          this.mpNeedsSnapshotSync = false;
+          this.player.position.set(p.x, Math.max(p.y, groundHeightAt(p.x, p.z)), p.z);
+          this.kills = p.kills;
+        }
+        this.player.health = Math.max(0, Math.min(this.player.maxHealth, p.health));
+        if (typeof p.armor === 'number') {
+          this.player.armor = Math.max(0, p.armor);
+        }
+        if ((!p.alive || p.health <= 0) && !this.mpDowned) {
+          this.mpDowned = true;
+          this.callbacks.onToast('You are DOWNED — waiting for squad outcome or Pause to exit.', true);
+          this.emitHUD();
+        }
         continue;
       }
 

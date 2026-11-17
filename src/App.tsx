@@ -198,15 +198,19 @@ export default function App() {
         setPendingInvite(invite);
         audioMgr.playChatPing();
       },
-      onMatchStarted: (_roomId, mode) => {
+      onMatchStarted: (_roomId, mode, meta) => {
         audioMgr.unlock();
         void attemptLandscapeLock();
         setActiveModal(null);
         setGameOverStats(null);
         setMpError(null);
         setScreen('playing');
-        engineRef.current?.startMultiplayerGame(mode, mpClient.getNetworkPlayerId());
-        pushToast(`Squad deployed (${mode.toUpperCase()})`);
+        engineRef.current?.startMultiplayerGame(mode, mpClient.getNetworkPlayerId(), meta);
+        pushToast(
+          meta?.isReconnect
+            ? `Reconnected to ${mode.toUpperCase()} match`
+            : `Squad deployed (${mode.toUpperCase()})`
+        );
       },
       onMatchSnapshot: (snapshot) => {
         engineRef.current?.applyServerMatchSnapshot(snapshot);
@@ -311,11 +315,14 @@ export default function App() {
     audioMgr.unlock();
     audioMgr.playUIClick();
     void attemptLandscapeLock();
+    if (mpClient.currentRoom) {
+      mpClient.leaveRoom();
+    }
     setActiveModal(null);
     setGameOverStats(null);
     setScreen('playing');
     engineRef.current?.startNewGame();
-  }, [audioMgr, attemptLandscapeLock]);
+  }, [audioMgr, attemptLandscapeLock, mpClient]);
 
   const handlePause = useCallback(() => {
     audioMgr.playUIClick();

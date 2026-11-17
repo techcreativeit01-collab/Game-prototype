@@ -182,6 +182,37 @@ function chooseServerZombieType(wave: number, spawned: number): ZombieType {
   return 'tank' as ZombieType;
 }
 
+function buildMatchSnapshot(room: RoomRuntime): MultiplayerMatchSnapshot {
+  return {
+    roomId: room.state.roomId,
+    mode: room.state.mode,
+    serverTime: Date.now(),
+    wave: room.wave,
+    waveState: room.waveState,
+    waveCountdown: Math.max(0, Math.ceil(room.waveCountdown)),
+    zombiesRemaining: room.zombiesRemaining,
+    waveTotalZombies: room.waveTotalZombies,
+    players: Array.from(room.players.values()).map((p) => ({
+      ...p,
+      armor: Math.round(p.armor),
+    })),
+    zombies: room.zombies.map(
+      (z): ServerZombieSnapshot => ({
+        id: z.id,
+        type: z.type,
+        x: z.x,
+        y: z.y,
+        z: z.z,
+        yaw: z.yaw,
+        health: z.health,
+        maxHealth: z.maxHealth,
+        state: z.state,
+      })
+    ),
+    winnerId: room.winnerId,
+  };
+}
+
 function startRoomMatch(room: RoomRuntime): void {
   if (room.countdownTimer) {
     clearInterval(room.countdownTimer);
@@ -230,11 +261,21 @@ function startRoomMatch(room: RoomRuntime): void {
   });
 
   broadcastRoom(room, { type: 'room:state', room: room.state });
-  broadcastRoom(room, {
-    type: 'match:started',
-    roomId: room.state.roomId,
-    mode: room.state.mode,
-  });
+  for (const m of room.state.members) {
+    const c = clients.get(m.playerId);
+    const mp = room.players.get(m.playerId);
+    if (c && c.ws.readyState === WebSocket.OPEN) {
+      sendTo(c.ws, {
+        type: 'match:started',
+        roomId: room.state.roomId,
+        mode: room.state.mode,
+        isReconnect: false,
+        spawnX: mp?.x ?? 0,
+        spawnZ: mp?.z ?? 0,
+      });
+    }
+  }
+  broadcastRoom(room, { type: 'match:snapshot', snapshot: buildMatchSnapshot(room) });
   broadcastLobbyState();
 
   const dt = 0.05; // 20Hz authoritative loop
@@ -257,6 +298,14 @@ function stepRoomMatch(room: RoomRuntime, dt: number): void {
     stopRoomTimers(room);
     return;
   }
+
+  const now = Date.now();
+  room.players.forEach((p) => {
+    if (p.alive && p.disconnectedAt !== null && now - p.disconnectedAt > 45000) {
+      p.alive = false;
+      p.health = 0;
+    }
+  });
 
   const alivePlayers = Array.from(room.players.values()).filter((p) => p.alive);
 
@@ -387,33 +436,7 @@ function stepRoomMatch(room: RoomRuntime, dt: number): void {
     }
   }
 
-  const snapshot: MultiplayerMatchSnapshot = {
-    roomId: room.state.roomId,
-    mode: room.state.mode,
-    serverTime: Date.now(),
-    wave: room.wave,
-    waveState: room.waveState,
-    waveCountdown: Math.max(0, Math.ceil(room.waveCountdown)),
-    zombiesRemaining: room.zombiesRemaining,
-    waveTotalZombies: room.waveTotalZombies,
-    players: Array.from(room.players.values()),
-    zombies: room.zombies.map(
-      (z): ServerZombieSnapshot => ({
-        id: z.id,
-        type: z.type,
-        x: z.x,
-        y: z.y,
-        z: z.z,
-        yaw: z.yaw,
-        health: z.health,
-        maxHealth: z.maxHealth,
-        state: z.state,
-      })
-    ),
-    winnerId: room.winnerId,
-  };
-
-  broadcastRoom(room, { type: 'match:snapshot', snapshot });
+  broadcastRoom(room, { type: 'match:snapshot', snapshot: buildMatchSnapshot(room) });
 }
 
 function finishRoomMatch(room: RoomRuntime, winnerId: string | null, reason: string): void {
@@ -638,23 +661,47 @@ async function bootstrapServer() {
           roomId: null,
         };
         clients.set(pid, session);
-        sendTo(ws, { type: 'auth:welcome', playerId: pid, lobbyCapacity: LOBBY_CAPACITY });
 
-        // Reconnect recovery into active match room if present
+        // Reconnect recovery into active room if present
+        let reconnectedRoomId: string | null = null;
         if (msg.reconnectRoomId && rooms.has(msg.reconnectRoomId)) {
           const r = rooms.get(msg.reconnectRoomId)!;
           const member = r.state.members.find((m) => m.playerId === pid);
-          if (member) {
+          if (member && r.state.status !== 'ended') {
+            reconnectedRoomId = r.state.roomId;
             member.connected = true;
             session.roomId = r.state.roomId;
             const mp = r.players.get(pid);
             if (mp) mp.disconnectedAt = null;
-            sendTo(ws, { type: 'room:state', room: r.state });
-            if (r.state.status === 'playing') {
-              sendTo(ws, { type: 'match:started', roomId: r.state.roomId, mode: r.state.mode });
-            }
           }
         }
+
+        sendTo(ws, {
+          type: 'auth:welcome',
+          playerId: pid,
+          lobbyCapacity: LOBBY_CAPACITY,
+          reconnectedRoomId,
+        });
+
+        if (reconnectedRoomId) {
+          const r = rooms.get(reconnectedRoomId)!;
+          broadcastRoom(r, { type: 'room:state', room: r.state });
+          if (r.state.status === 'playing') {
+            const mp = r.players.get(pid);
+            sendTo(ws, {
+              type: 'match:started',
+              roomId: r.state.roomId,
+              mode: r.state.mode,
+              isReconnect: true,
+              spawnX: mp?.x ?? 0,
+              spawnZ: mp?.z ?? 0,
+            });
+            sendTo(ws, { type: 'match:snapshot', snapshot: buildMatchSnapshot(r) });
+          }
+        } else if (msg.reconnectRoomId) {
+          sendTo(ws, { type: 'room:state', room: null });
+        }
+
         broadcastLobbyState();
         return;
       }
@@ -875,13 +922,18 @@ async function bootstrapServer() {
 
         case 'rtc:signal': {
           const target = clients.get(msg.targetPlayerId);
-          if (target) {
+          if (target && target.ws.readyState === WebSocket.OPEN) {
             sendTo(target.ws, {
               type: 'rtc:signal',
               fromPlayerId: session.playerId,
               payload: msg.payload,
             });
           }
+          break;
+        }
+
+        case 'ping': {
+          sendTo(ws, { type: 'pong', serverTime: Date.now() });
           break;
         }
       }

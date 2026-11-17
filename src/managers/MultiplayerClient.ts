@@ -17,13 +17,23 @@ export interface InviteNotice {
   roomName: string;
 }
 
+export interface MatchStartMeta {
+  isReconnect?: boolean;
+  spawnX?: number;
+  spawnZ?: number;
+}
+
 export interface MultiplayerListener {
   onStatusChange?: (status: MpConnectionStatus) => void;
   onLobbyUpdate?: (players: LobbyPlayer[], rooms: MultiplayerRoomState[]) => void;
   onRoomUpdate?: (room: MultiplayerRoomState | null) => void;
   onChatMessage?: (msg: ChatMessage) => void;
   onInvited?: (invite: InviteNotice) => void;
-  onMatchStarted?: (roomId: string, mode: 'coop' | 'competitive') => void;
+  onMatchStarted?: (
+    roomId: string,
+    mode: 'coop' | 'competitive',
+    meta?: MatchStartMeta
+  ) => void;
   onMatchSnapshot?: (snapshot: MultiplayerMatchSnapshot) => void;
   onZombieKilled?: (
     zombieId: number,
@@ -47,7 +57,40 @@ export interface MultiplayerListener {
   onError?: (message: string) => void;
 }
 
+interface PeerEntry {
+  pc: RTCPeerConnection;
+  polite: boolean;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  isSettingRemoteAnswerPending: boolean;
+  pendingCandidates: RTCIceCandidateInit[];
+  iceRestartAttempts: number;
+}
+
+interface RtcSignalPayload {
+  sdp?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
+}
+
 const TAB_ID_STORAGE_KEY = 'zs_mp_tab_id';
+const ROOM_ID_STORAGE_KEY = 'zs_mp_room_id';
+const HEARTBEAT_INTERVAL_MS = 10000;
+const HEARTBEAT_TIMEOUT_MS = 18000;
+const MAX_RECONNECT_ATTEMPTS = 12;
+const MAX_QUEUED_CONTROLS = 20;
+
+const QUEUEABLE_CONTROL_TYPES = new Set<ClientToServerMsg['type']>([
+  'profile:update',
+  'lobby:chat',
+  'room:chat',
+  'lobby:invite',
+  'room:create',
+  'room:join',
+  'room:quick_match',
+  'room:leave',
+  'room:ready',
+  'room:start',
+]);
 
 export class MultiplayerClient {
   private ws: WebSocket | null = null;
@@ -55,14 +98,20 @@ export class MultiplayerClient {
   private maxHealth = 120;
   private readonly networkPlayerId: string;
   private status: MpConnectionStatus = 'disconnected';
+  private authenticated = false;
   private listeners = new Set<MultiplayerListener>();
   private lastRoomId: string | null = null;
   private reconnectTimer: number | null = null;
+  private reconnectAttempts = 0;
+  private pingTimer: number | null = null;
+  private lastPongAt = 0;
   private manuallyClosed = false;
+  private browserEventsBound = false;
+  private pendingControlQueue: ClientToServerMsg[] = [];
 
-  // Optional WebRTC peer mesh for squad voice chat
+  // Perfect Negotiation WebRTC peer mesh for squad voice chat
   private localStream: MediaStream | null = null;
-  private peers = new Map<string, RTCPeerConnection>();
+  private peers = new Map<string, PeerEntry>();
   private micMuted = true;
   private voiceDeafened = false;
 
@@ -75,6 +124,7 @@ export class MultiplayerClient {
     this.profile = { ...profile };
     this.maxHealth = maxHealth;
     this.networkPlayerId = this.resolveTabNetworkId(profile.playerId);
+    this.lastRoomId = this.readStoredRoomId();
   }
 
   private resolveTabNetworkId(baseId: string): string {
@@ -92,6 +142,30 @@ export class MultiplayerClient {
       return generated;
     } catch {
       return `${baseId.slice(0, 12)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+    }
+  }
+
+  private readStoredRoomId(): string | null {
+    if (typeof window === 'undefined') return null;
+    try {
+      const stored = window.sessionStorage.getItem(ROOM_ID_STORAGE_KEY);
+      return stored && stored.trim().length > 0 ? stored : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private persistRoomId(roomId: string | null): void {
+    this.lastRoomId = roomId;
+    if (typeof window === 'undefined') return;
+    try {
+      if (roomId) {
+        window.sessionStorage.setItem(ROOM_ID_STORAGE_KEY, roomId);
+      } else {
+        window.sessionStorage.removeItem(ROOM_ID_STORAGE_KEY);
+      }
+    } catch {
+      // ignore storage quota / privacy mode errors
     }
   }
 
@@ -116,13 +190,67 @@ export class MultiplayerClient {
     return this.voiceDeafened;
   }
 
+  private handleBrowserOnline = (): void => {
+    if (this.manuallyClosed) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.clearReconnectTimer();
+      this.reconnectAttempts = 0;
+      this.connect();
+    }
+  };
+
+  private handleVisibilityChange = (): void => {
+    if (this.manuallyClosed || typeof document === 'undefined') return;
+    if (document.visibilityState !== 'visible') return;
+
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.clearReconnectTimer();
+      this.reconnectAttempts = 0;
+      this.connect();
+    } else if (this.authenticated) {
+      // Probe socket health immediately after returning from background tab
+      if (Date.now() - this.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+        this.ws.close(4001, 'Stale background socket');
+      } else {
+        this.sendRaw({ type: 'ping' });
+      }
+    }
+  };
+
+  private bindBrowserEvents(): void {
+    if (this.browserEventsBound || typeof window === 'undefined') return;
+    this.browserEventsBound = true;
+    window.addEventListener('online', this.handleBrowserOnline);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+  }
+
+  private unbindBrowserEvents(): void {
+    if (!this.browserEventsBound || typeof window === 'undefined') return;
+    this.browserEventsBound = false;
+    window.removeEventListener('online', this.handleBrowserOnline);
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+  }
+
   connect(maxHealth?: number): void {
     if (typeof maxHealth === 'number') this.maxHealth = maxHealth;
     if (typeof window === 'undefined') return;
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+
+    this.bindBrowserEvents();
+
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+    ) {
       return;
     }
+
+    this.clearReconnectTimer();
     this.manuallyClosed = false;
+    this.authenticated = false;
     this.setStatus('connecting');
 
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -131,8 +259,10 @@ export class MultiplayerClient {
     this.ws = ws;
 
     ws.onopen = () => {
-      this.setStatus('connected');
-      this.send({
+      if (this.ws !== ws) return;
+      this.lastPongAt = Date.now();
+      this.startHeartbeat(ws);
+      this.sendRaw({
         type: 'auth:hello',
         playerId: this.networkPlayerId,
         username: this.profile.username,
@@ -145,6 +275,8 @@ export class MultiplayerClient {
     };
 
     ws.onmessage = (evt) => {
+      if (this.ws !== ws) return;
+      this.lastPongAt = Date.now();
       try {
         const msg = JSON.parse(String(evt.data)) as ServerToClientMsg;
         this.handleServerMessage(msg);
@@ -154,46 +286,144 @@ export class MultiplayerClient {
     };
 
     ws.onclose = () => {
-      this.setStatus('disconnected');
+      if (this.ws !== ws) return;
+      this.stopHeartbeat();
+      this.authenticated = false;
       this.ws = null;
+      this.setStatus('disconnected');
       if (!this.manuallyClosed) {
         this.scheduleReconnect();
       }
     };
 
     ws.onerror = () => {
-      // handled by onclose
+      // handled cleanly by onclose
     };
   }
 
   disconnect(): void {
     this.manuallyClosed = true;
+    this.authenticated = false;
+    this.pendingControlQueue = [];
+    this.clearReconnectTimer();
+    this.stopHeartbeat();
+    this.unbindBrowserEvents();
+    this.teardownVoice();
+    const activeWs = this.ws;
+    this.ws = null;
+    if (activeWs) {
+      try {
+        activeWs.close();
+      } catch {
+        // ignore close errors
+      }
+    }
+    this.setStatus('disconnected');
+  }
+
+  private clearReconnectTimer(): void {
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.teardownVoice();
-    this.ws?.close();
-    this.ws = null;
-    this.setStatus('disconnected');
+  }
+
+  private startHeartbeat(ws: WebSocket): void {
+    this.stopHeartbeat();
+    this.pingTimer = window.setInterval(() => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+        this.stopHeartbeat();
+        return;
+      }
+      if (Date.now() - this.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+        this.stopHeartbeat();
+        ws.close(4001, 'Heartbeat timeout');
+        return;
+      }
+      this.sendRaw({ type: 'ping' });
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.pingTimer !== null) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectTimer !== null) return;
+    if (this.reconnectTimer !== null || this.manuallyClosed) return;
+    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      this.listeners.forEach((l) =>
+        l.onError?.('Connection lost after multiple retries. Check network or reconnect.')
+      );
+      return;
+    }
+
+    const baseDelay = Math.min(15000, 1000 * Math.pow(2, this.reconnectAttempts));
+    const jitteredDelay = Math.round(baseDelay * (0.75 + Math.random() * 0.5));
+    this.reconnectAttempts++;
+
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
-      if (!this.manuallyClosed) this.connect();
-    }, 2500);
+      if (!this.manuallyClosed) {
+        this.connect();
+      }
+    }, jitteredDelay);
   }
 
   private setStatus(next: MpConnectionStatus): void {
+    if (this.status === next) return;
     this.status = next;
     this.listeners.forEach((l) => l.onStatusChange?.(next));
   }
 
-  send(msg: ClientToServerMsg): void {
+  private sendRaw(msg: ClientToServerMsg): boolean {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
+      return true;
+    }
+    return false;
+  }
+
+  send(msg: ClientToServerMsg): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.authenticated) {
+      this.ws.send(JSON.stringify(msg));
+      return;
+    }
+
+    if (QUEUEABLE_CONTROL_TYPES.has(msg.type)) {
+      if (msg.type === 'room:leave') {
+        this.pendingControlQueue = this.pendingControlQueue.filter(
+          (q) => !q.type.startsWith('room:')
+        );
+      } else if (msg.type === 'profile:update') {
+        this.pendingControlQueue = this.pendingControlQueue.filter(
+          (q) => q.type !== 'profile:update'
+        );
+      }
+      if (this.pendingControlQueue.length >= MAX_QUEUED_CONTROLS) {
+        this.pendingControlQueue.shift();
+      }
+      this.pendingControlQueue.push(msg);
+
+      if (
+        !this.manuallyClosed &&
+        (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING)
+      ) {
+        this.clearReconnectTimer();
+        this.reconnectAttempts = 0;
+        this.connect();
+      }
+    }
+  }
+
+  private flushPendingControls(): void {
+    if (!this.authenticated || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (this.pendingControlQueue.length === 0) return;
+    const queued = this.pendingControlQueue.splice(0, this.pendingControlQueue.length);
+    for (const msg of queued) {
+      this.sendRaw(msg);
     }
   }
 
@@ -223,7 +453,7 @@ export class MultiplayerClient {
   }
 
   leaveRoom(): void {
-    this.lastRoomId = null;
+    this.persistRoomId(null);
     this.send({ type: 'room:leave' });
   }
 
@@ -283,6 +513,7 @@ export class MultiplayerClient {
           t.enabled = true;
         });
         this.micMuted = false;
+        this.attachLocalTracksToExistingPeers();
         this.connectSquadVoicePeers();
       } catch {
         this.listeners.forEach((l) => l.onError?.('Microphone permission denied or unavailable.'));
@@ -306,25 +537,98 @@ export class MultiplayerClient {
     return this.voiceDeafened;
   }
 
+  private attachLocalTracksToExistingPeers(): void {
+    if (!this.localStream) return;
+    const tracks = this.localStream.getTracks();
+    this.peers.forEach((entry, remoteId) => {
+      if (entry.pc.signalingState === 'closed') return;
+      const existingSenders = entry.pc.getSenders();
+      let addedTrack = false;
+      for (const track of tracks) {
+        if (!existingSenders.some((s) => s.track?.id === track.id)) {
+          entry.pc.addTrack(track, this.localStream!);
+          addedTrack = true;
+        }
+      }
+      if (addedTrack && entry.pc.signalingState === 'stable' && !entry.makingOffer) {
+        void this.initiatePeerOffer(remoteId);
+      }
+    });
+  }
+
   private connectSquadVoicePeers(): void {
     if (!this.currentRoom) return;
     for (const m of this.currentRoom.members) {
-      if (m.playerId === this.networkPlayerId || this.peers.has(m.playerId)) continue;
-      void this.initiatePeerOffer(m.playerId);
+      if (m.playerId === this.networkPlayerId || !m.connected) continue;
+      const existing = this.peers.get(m.playerId);
+      if (!existing || existing.pc.signalingState === 'closed') {
+        void this.initiatePeerOffer(m.playerId);
+      }
     }
   }
 
+  private pruneStalePeers(room: MultiplayerRoomState | null): void {
+    if (!room) {
+      this.closeVoicePeers();
+      return;
+    }
+    const memberIds = new Set(room.members.map((m) => m.playerId));
+    for (const remoteId of Array.from(this.peers.keys())) {
+      if (!memberIds.has(remoteId)) {
+        this.cleanupPeer(remoteId);
+      }
+    }
+  }
+
+  private cleanupPeer(remoteId: string): void {
+    const entry = this.peers.get(remoteId);
+    if (entry) {
+      entry.pc.onicecandidate = null;
+      entry.pc.ontrack = null;
+      entry.pc.oniceconnectionstatechange = null;
+      entry.pc.onconnectionstatechange = null;
+      try {
+        entry.pc.close();
+      } catch {
+        // ignore close error
+      }
+      this.peers.delete(remoteId);
+    }
+    document
+      .querySelectorAll<HTMLAudioElement>(`audio[data-mp-voice="true"][data-peer="${remoteId}"]`)
+      .forEach((el) => el.remove());
+  }
+
   private closeVoicePeers(): void {
-    this.peers.forEach((pc) => pc.close());
-    this.peers.clear();
+    for (const remoteId of Array.from(this.peers.keys())) {
+      this.cleanupPeer(remoteId);
+    }
     document.querySelectorAll('audio[data-mp-voice="true"]').forEach((el) => el.remove());
   }
 
-  private createPeerConnection(remoteId: string): RTCPeerConnection {
+  private getOrCreatePeerEntry(remoteId: string): PeerEntry {
+    const existing = this.peers.get(remoteId);
+    if (existing && existing.pc.signalingState !== 'closed') {
+      return existing;
+    }
+    if (existing) {
+      this.cleanupPeer(remoteId);
+    }
+
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
     });
-    this.peers.set(remoteId, pc);
+
+    const entry: PeerEntry = {
+      pc,
+      polite: this.networkPlayerId < remoteId,
+      makingOffer: false,
+      ignoreOffer: false,
+      isSettingRemoteAnswerPending: false,
+      pendingCandidates: [],
+      iceRestartAttempts: 0,
+    };
+    this.peers.set(remoteId, entry);
 
     if (this.localStream) {
       for (const track of this.localStream.getTracks()) {
@@ -333,18 +637,45 @@ export class MultiplayerClient {
     }
 
     pc.onicecandidate = (e) => {
+      if (this.peers.get(remoteId) !== entry) return;
       if (e.candidate) {
         this.send({
           type: 'rtc:signal',
           targetPlayerId: remoteId,
-          payload: { candidate: e.candidate },
+          payload: { candidate: e.candidate.toJSON ? e.candidate.toJSON() : e.candidate },
         });
       }
     };
 
+    pc.oniceconnectionstatechange = () => {
+      if (this.peers.get(remoteId) !== entry) return;
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        entry.iceRestartAttempts = 0;
+      } else if (pc.iceConnectionState === 'failed') {
+        if (entry.iceRestartAttempts < 2) {
+          entry.iceRestartAttempts++;
+          void this.restartPeerIce(remoteId);
+        } else {
+          this.cleanupPeer(remoteId);
+        }
+      } else if (pc.iceConnectionState === 'closed') {
+        this.cleanupPeer(remoteId);
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (this.peers.get(remoteId) !== entry) return;
+      if (pc.connectionState === 'closed') {
+        this.cleanupPeer(remoteId);
+      } else if (pc.connectionState === 'failed' && entry.iceRestartAttempts >= 2) {
+        this.cleanupPeer(remoteId);
+      }
+    };
+
     pc.ontrack = (e) => {
+      if (this.peers.get(remoteId) !== entry) return;
       let audioEl = document.querySelector<HTMLAudioElement>(
-        `audio[data-peer="${remoteId}"]`
+        `audio[data-mp-voice="true"][data-peer="${remoteId}"]`
       );
       if (!audioEl) {
         audioEl = document.createElement('audio');
@@ -357,62 +688,162 @@ export class MultiplayerClient {
       audioEl.srcObject = e.streams[0] ?? new MediaStream([e.track]);
     };
 
-    return pc;
+    return entry;
+  }
+
+  private async restartPeerIce(remoteId: string): Promise<void> {
+    const entry = this.peers.get(remoteId);
+    if (!entry || entry.pc.signalingState !== 'stable' || entry.makingOffer) return;
+    try {
+      entry.makingOffer = true;
+      const offer = await entry.pc.createOffer({ iceRestart: true });
+      if (this.peers.get(remoteId) !== entry || entry.pc.signalingState !== 'stable') return;
+      await entry.pc.setLocalDescription(offer);
+      if (entry.pc.localDescription) {
+        this.send({
+          type: 'rtc:signal',
+          targetPlayerId: remoteId,
+          payload: { sdp: entry.pc.localDescription },
+        });
+      }
+    } catch {
+      // ignore ICE restart errors on disconnected peers
+    } finally {
+      entry.makingOffer = false;
+    }
   }
 
   private async initiatePeerOffer(remoteId: string): Promise<void> {
+    const entry = this.getOrCreatePeerEntry(remoteId);
+    if (entry.makingOffer || entry.pc.signalingState !== 'stable') return;
+
     try {
-      const pc = this.createPeerConnection(remoteId);
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      this.send({
-        type: 'rtc:signal',
-        targetPlayerId: remoteId,
-        payload: { sdp: pc.localDescription },
-      });
+      entry.makingOffer = true;
+      const offer = await entry.pc.createOffer();
+      if (this.peers.get(remoteId) !== entry || entry.pc.signalingState !== 'stable') {
+        return;
+      }
+      await entry.pc.setLocalDescription(offer);
+      if (entry.pc.localDescription) {
+        this.send({
+          type: 'rtc:signal',
+          targetPlayerId: remoteId,
+          payload: { sdp: entry.pc.localDescription },
+        });
+      }
     } catch {
       // ignore WebRTC setup failure on restricted networks
+    } finally {
+      entry.makingOffer = false;
+    }
+  }
+
+  private async flushPendingCandidates(entry: PeerEntry): Promise<void> {
+    if (!entry.pc.remoteDescription || !entry.pc.remoteDescription.type) return;
+    while (entry.pendingCandidates.length > 0) {
+      const candidate = entry.pendingCandidates.shift()!;
+      try {
+        await entry.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // ignore stale ICE candidate
+      }
     }
   }
 
   private async handleRtcSignal(fromId: string, payload: unknown): Promise<void> {
-    try {
-      const data = payload as { sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit };
-      let pc = this.peers.get(fromId);
-      if (!pc) pc = this.createPeerConnection(fromId);
+    if (!payload || typeof payload !== 'object') return;
+    if (!this.currentRoom?.members.some((m) => m.playerId === fromId)) return;
 
+    const data = payload as RtcSignalPayload;
+    const entry = this.getOrCreatePeerEntry(fromId);
+    const { pc } = entry;
+
+    try {
       if (data.sdp) {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-        if (data.sdp.type === 'offer') {
+        const description = new RTCSessionDescription(data.sdp);
+        const readyForOffer =
+          !entry.makingOffer &&
+          (pc.signalingState === 'stable' || entry.isSettingRemoteAnswerPending);
+        const offerCollision = description.type === 'offer' && !readyForOffer;
+
+        entry.ignoreOffer = !entry.polite && offerCollision;
+        if (entry.ignoreOffer) return;
+
+        if (description.type === 'answer') {
+          if (pc.signalingState !== 'have-local-offer') {
+            return;
+          }
+          entry.isSettingRemoteAnswerPending = true;
+        } else if (offerCollision && entry.polite && pc.signalingState !== 'stable') {
+          await pc.setLocalDescription({ type: 'rollback' }).catch(() => undefined);
+        }
+
+        try {
+          await pc.setRemoteDescription(description);
+        } finally {
+          entry.isSettingRemoteAnswerPending = false;
+        }
+
+        await this.flushPendingCandidates(entry);
+
+        if (description.type === 'offer') {
           const answer = await pc.createAnswer();
+          if (this.peers.get(fromId) !== entry) return;
           await pc.setLocalDescription(answer);
-          this.send({
-            type: 'rtc:signal',
-            targetPlayerId: fromId,
-            payload: { sdp: pc.localDescription },
-          });
+          if (pc.localDescription) {
+            this.send({
+              type: 'rtc:signal',
+              targetPlayerId: fromId,
+              payload: { sdp: pc.localDescription },
+            });
+          }
         }
       } else if (data.candidate) {
-        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        if (entry.ignoreOffer) return;
+        if (!pc.remoteDescription || !pc.remoteDescription.type) {
+          if (entry.pendingCandidates.length < 64) {
+            entry.pendingCandidates.push(data.candidate);
+          }
+          return;
+        }
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        } catch {
+          if (!entry.ignoreOffer) {
+            // ignore mismatched ICE candidate
+          }
+        }
       }
     } catch {
-      // ignore signaling race
+      // keep signaling resilient against transient state races
     }
   }
 
   private teardownVoice(): void {
-    this.peers.forEach((pc) => pc.close());
-    this.peers.clear();
+    this.closeVoicePeers();
     if (this.localStream) {
       this.localStream.getTracks().forEach((t) => t.stop());
       this.localStream = null;
     }
     this.micMuted = true;
-    document.querySelectorAll('audio[data-mp-voice="true"]').forEach((el) => el.remove());
   }
 
   private handleServerMessage(msg: ServerToClientMsg): void {
     switch (msg.type) {
+      case 'auth:welcome':
+        this.authenticated = true;
+        this.reconnectAttempts = 0;
+        if (msg.reconnectedRoomId === null) {
+          this.persistRoomId(null);
+        } else if (msg.reconnectedRoomId) {
+          this.persistRoomId(msg.reconnectedRoomId);
+        }
+        this.setStatus('connected');
+        this.flushPendingControls();
+        break;
+      case 'pong':
+        this.lastPongAt = Date.now();
+        break;
       case 'lobby:state':
         this.lobbyPlayers = msg.players;
         this.rooms = msg.rooms;
@@ -420,10 +851,9 @@ export class MultiplayerClient {
         break;
       case 'room:state':
         this.currentRoom = msg.room;
-        this.lastRoomId = msg.room ? msg.room.roomId : null;
-        if (!msg.room) {
-          this.closeVoicePeers();
-        } else if (!this.micMuted) {
+        this.persistRoomId(msg.room ? msg.room.roomId : null);
+        this.pruneStalePeers(msg.room);
+        if (msg.room && !this.micMuted) {
           this.connectSquadVoicePeers();
         }
         this.listeners.forEach((l) => l.onRoomUpdate?.(msg.room));
@@ -442,7 +872,13 @@ export class MultiplayerClient {
         );
         break;
       case 'match:started':
-        this.listeners.forEach((l) => l.onMatchStarted?.(msg.roomId, msg.mode));
+        this.listeners.forEach((l) =>
+          l.onMatchStarted?.(msg.roomId, msg.mode, {
+            isReconnect: msg.isReconnect,
+            spawnX: msg.spawnX,
+            spawnZ: msg.spawnZ,
+          })
+        );
         break;
       case 'match:snapshot':
         this.listeners.forEach((l) => l.onMatchSnapshot?.(msg.snapshot));
