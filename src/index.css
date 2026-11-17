@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Chakra Petch', sans-serif;
+    --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  html, body, #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background-color: #07090d;
+    color: #eceff4;
+    font-family: var(--font-sans);
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono-tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.game-touch-surface {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Custom dark scrollbar for Armory / Inventory / Settings modals */
+.survival-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.survival-scroll::-webkit-scrollbar-track {
+  background: #0d1017;
+}
+.survival-scroll::-webkit-scrollbar-thumb {
+  background: #272e3b;
+  border-radius: 3px;
+}
+.survival-scroll::-webkit-scrollbar-thumb:hover {
+  background: #991b1b;
+}

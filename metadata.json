@@ -1,0 +1,6 @@
+{
+  "name": "ZOMBIE SHOOTER",
+  "description": "3D First-Person Zombie Survival Shooter set in a dark moonlit forest with procedural weapons, waves, upgrades, and tactical equipment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
